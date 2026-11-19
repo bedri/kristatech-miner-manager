@@ -10,7 +10,7 @@ ThemeColors colors(bool isLight)
     if (isLight) {
         c.slateBlue = QStringLiteral("#5576B2");
         c.slateAccent = QStringLiteral("#7695CD");
-        c.salmon = QStringLiteral("#E87B6E");
+        c.salmon = QStringLiteral("#DC7B82");
         c.pageBg = QStringLiteral("#EEF2F7");
         c.cardBg = QStringLiteral("#FFFFFF");
         c.innerBg = QStringLiteral("#F5F8FC");
@@ -23,19 +23,19 @@ ThemeColors colors(bool isLight)
         c.tableAltBg = QStringLiteral("#F8FAFD");
         c.selectBg = QStringLiteral("#DCE8FA");
         c.successBg = QStringLiteral("#ECFDF5");
-        c.successFg = QStringLiteral("#18795B");
-        c.warnBg = QStringLiteral("#FEF8EE");
-        c.warnBorder = QStringLiteral("#EED2A5");
-        c.warnFg = QStringLiteral("#9A5812");
-        c.dangerBg = QStringLiteral("#FDF2F1");
-        c.dangerBorder = QStringLiteral("#F0B9B1");
-        c.dangerFg = QStringLiteral("#C2453B");
+        c.successFg = QStringLiteral("#1F735D");
+        c.warnBg = QStringLiteral("#F3F1F8");
+        c.warnBorder = QStringLiteral("#D6CEE6");
+        c.warnFg = QStringLiteral("#5E4B82");
+        c.dangerBg = QStringLiteral("#FAF1F2");
+        c.dangerBorder = QStringLiteral("#E6C4C7");
+        c.dangerFg = QStringLiteral("#A83E45");
         c.logBg = QStringLiteral("#F5F8FC");
         c.logFg = QStringLiteral("#1E2E48");
     } else {
         c.slateBlue = QStringLiteral("#5B7EC0");
         c.slateAccent = QStringLiteral("#82A3DB");
-        c.salmon = QStringLiteral("#F28C80");
+        c.salmon = QStringLiteral("#E8939A");
         c.pageBg = QStringLiteral("#0A0F1C");
         c.cardBg = QStringLiteral("#111829");
         c.innerBg = QStringLiteral("#172136");
@@ -48,13 +48,13 @@ ThemeColors colors(bool isLight)
         c.tableAltBg = QStringLiteral("#141D31");
         c.selectBg = QStringLiteral("#22365C");
         c.successBg = QStringLiteral("#0E2923");
-        c.successFg = QStringLiteral("#3DD6A4");
-        c.warnBg = QStringLiteral("#282012");
-        c.warnBorder = QStringLiteral("#5E4823");
-        c.warnFg = QStringLiteral("#F2BE5C");
-        c.dangerBg = QStringLiteral("#331B20");
-        c.dangerBorder = QStringLiteral("#7A3C43");
-        c.dangerFg = QStringLiteral("#F59B92");
+        c.successFg = QStringLiteral("#45CFA3");
+        c.warnBg = QStringLiteral("#1B192B");
+        c.warnBorder = QStringLiteral("#3B3459");
+        c.warnFg = QStringLiteral("#BBA8E0");
+        c.dangerBg = QStringLiteral("#2B1920");
+        c.dangerBorder = QStringLiteral("#5E3440");
+        c.dangerFg = QStringLiteral("#E899A0");
         c.logBg = QStringLiteral("#0B1120");
         c.logFg = QStringLiteral("#D8E4F5");
     }
@@ -73,12 +73,12 @@ QString buildStylesheet(bool isLight)
     const QString btnSubtleHover = isLight ? QStringLiteral("#E5EEF9") : QStringLiteral("#243456");
     const QString btnSubtlePressed = isLight ? QStringLiteral("#D5E2F4") : QStringLiteral("#2D4069");
     const QString primaryHover = isLight ? QStringLiteral("#46659E") : QStringLiteral("#4C6FAE");
-    const QString dangerSolidBg = isLight ? QStringLiteral("#C94D43") : QStringLiteral("#C24B42");
-    const QString dangerSolidHover = isLight ? QStringLiteral("#B34037") : QStringLiteral("#A93E36");
-    const QString salmonBg = isLight ? QStringLiteral("#FDEEEA") : QStringLiteral("#331D22");
-    const QString salmonFg = isLight ? QStringLiteral("#B03E34") : QStringLiteral("#F69B91");
-    const QString salmonBorder = isLight ? c.dangerBorder : QStringLiteral("#7A3C43");
-    const QString salmonHoverBg = isLight ? QStringLiteral("#FBDCD5") : QStringLiteral("#43242B");
+    const QString dangerSolidBg = isLight ? QStringLiteral("#BD4D54") : QStringLiteral("#B54A52");
+    const QString dangerSolidHover = isLight ? QStringLiteral("#A63E45") : QStringLiteral("#9E3D45");
+    const QString salmonBg = isLight ? QStringLiteral("#FAF0F1") : QStringLiteral("#2D1B22");
+    const QString salmonFg = isLight ? QStringLiteral("#9E3C43") : QStringLiteral("#ECA0A7");
+    const QString salmonBorder = isLight ? QStringLiteral("#E4BFC2") : QStringLiteral("#693945");
+    const QString salmonHoverBg = isLight ? QStringLiteral("#F5E2E4") : QStringLiteral("#3B222B");
     const QString rowHoverBg = isLight ? QStringLiteral("#EDF3FB") : QStringLiteral("#1A2742");
     const QString scrollHandle = isLight ? QStringLiteral("#C5D3E6") : QStringLiteral("#2B3D60");
 
