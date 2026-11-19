@@ -33,12 +33,14 @@
 #include <QPlainTextEdit>
 #include <QPointer>
 #include <QPushButton>
+#include <QResizeEvent>
 #include <QScopedValueRollback>
 #include <QScreen>
 #include <QScrollBar>
 #include <QSettings>
 #include <QShortcut>
 #include <QShowEvent>
+#include <QSignalBlocker>
 #include <QSplitter>
 #include <QStyle>
 #include <QTableWidget>
@@ -62,6 +64,18 @@ public:
         return QTableWidgetItem::operator<(other);
     }
 };
+
+QString formatTableAddress(const QString& addr)
+{
+    const QString trimmed = addr.trimmed();
+    if (trimmed.isEmpty()) {
+        return QStringLiteral("—");
+    }
+    if (trimmed.size() <= 22) {
+        return trimmed;
+    }
+    return trimmed.left(10) + QStringLiteral("…") + trimmed.right(8);
+}
 
 } // namespace
 
@@ -108,7 +122,8 @@ MainWindow::MainWindow(ConfigStore* store,
 
 void MainWindow::setupUi()
 {
-    resize(1380, 860);
+    m_expectedWindowSize = QSize(1440, 860);
+    resize(m_expectedWindowSize);
     setWindowIcon(Theme::appIcon());
 
     QWidget* central = new QWidget(this);
@@ -245,6 +260,13 @@ void MainWindow::setupUi()
     m_editSearch->setClearButtonEnabled(true);
     tbLay->addWidget(m_editSearch, 1);
 
+    m_chkAutoStopDeferred = new QCheckBox(toolbar);
+    m_chkAutoStopDeferred->setObjectName(QStringLiteral("chkAutoStopDeferred"));
+    m_chkAutoStopDeferred->setCursor(Qt::PointingHandCursor);
+    m_chkAutoStopDeferred->setFocusPolicy(Qt::NoFocus);
+    m_chkAutoStopDeferred->setChecked(m_controller->autoStopOnDeferred());
+    tbLay->addWidget(m_chkAutoStopDeferred);
+
     m_lblFilterCount = new QLabel(QStringLiteral("0 / 0"), toolbar);
     m_lblFilterCount->setObjectName(QStringLiteral("mutedLabel"));
     tbLay->addWidget(m_lblFilterCount);
@@ -331,6 +353,12 @@ void MainWindow::setupUi()
     connect(m_btnExport, &QPushButton::clicked, this, &MainWindow::onExportProfiles);
     connect(m_btnLang, &QPushButton::clicked, this, []() { I18n::instance().toggleLanguage(); });
     connect(m_btnTheme, &QPushButton::clicked, this, &MainWindow::onToggleTheme);
+    connect(m_chkAutoStopDeferred, &QCheckBox::toggled, this, &MainWindow::onAutoStopDeferredToggled);
+    connect(m_controller, &WorkerController::autoStopOnDeferredChanged, this, [this](bool enabled) {
+        if (!m_chkAutoStopDeferred) return;
+        const QSignalBlocker blocker(m_chkAutoStopDeferred);
+        m_chkAutoStopDeferred->setChecked(enabled);
+    });
 
     connect(m_comboEngineFilter, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::onFilterChanged);
     connect(m_comboTargetFilter, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::onFilterChanged);
@@ -451,6 +479,10 @@ void MainWindow::retranslateUi()
     m_comboTargetFilter->setItemText(3, KTr(QStringLiteral("target.custom")));
     m_comboTargetFilter->setItemText(4, KTr(QStringLiteral("target.ssh")));
     m_editSearch->setPlaceholderText(KTr(QStringLiteral("filter.search_ph")));
+    if (m_chkAutoStopDeferred) {
+        m_chkAutoStopDeferred->setText(KTr(QStringLiteral("opt.auto_stop_deferred")));
+        m_chkAutoStopDeferred->setToolTip(KTr(QStringLiteral("opt.auto_stop_deferred_tip")));
+    }
 
     {
         QScopedValueRollback<bool> guard(m_autoResizingColumns, true);
@@ -482,6 +514,9 @@ void MainWindow::retranslateUi()
 
     refreshTableAndKpis();
     fitTableColumnsToContents(/*allowShrink=*/true);
+    if (m_initialColumnFitDone && isVisible()) {
+        ensureWindowFitsTable();
+    }
 }
 
 void MainWindow::setLightTheme(bool isLight)
@@ -496,6 +531,9 @@ void MainWindow::setLightTheme(bool isLight)
     m_btnTheme->setText(KTr(m_isLight ? QStringLiteral("btn.theme_light") : QStringLiteral("btn.theme_dark")));
     refreshTableAndKpis();
     fitTableColumnsToContents(/*allowShrink=*/true);
+    if (m_initialColumnFitDone && isVisible()) {
+        ensureWindowFitsTable();
+    }
 }
 
 void MainWindow::showEvent(QShowEvent* event)
@@ -503,29 +541,51 @@ void MainWindow::showEvent(QShowEvent* event)
     QMainWindow::showEvent(event);
     if (!m_initialColumnFitDone) {
         m_initialColumnFitDone = true;
+        m_shownTimer.start();
         fitTableColumnsToContents(/*allowShrink=*/true);
-        ensureInitialWindowFitsTable();
+        ensureWindowFitsTable();
     }
 }
 
-void MainWindow::ensureInitialWindowFitsTable()
+void MainWindow::resizeEvent(QResizeEvent* event)
 {
-    if (!m_table) return;
+    QMainWindow::resizeEvent(event);
+    if (m_initialColumnFitDone && !m_programmaticResize && isVisible()
+        && event->oldSize().isValid() && event->oldSize() != event->size()
+        && event->size() != m_expectedWindowSize
+        && (!m_shownTimer.isValid() || m_shownTimer.elapsed() > 600)) {
+        m_userResizedWindow = true;
+    }
+}
+
+void MainWindow::ensureWindowFitsTable()
+{
+    if (!m_table || m_userResizedWindow || isMaximized() || isFullScreen()) {
+        return;
+    }
     int totalColsWidth = 0;
     for (int c = 0; c < m_table->columnCount(); ++c) {
         totalColsWidth += m_table->columnWidth(c);
     }
-    const int chromeW = (m_table->verticalScrollBar() ? m_table->verticalScrollBar()->sizeHint().width() : 16)
-                      + m_table->frameWidth() * 2 + 36;
-    const int neededW = totalColsWidth + chromeW;
+    const int sbW = m_table->verticalScrollBar()
+        ? qMax(14, m_table->verticalScrollBar()->sizeHint().width())
+        : 14;
+    const bool sbVisible = m_table->verticalScrollBar() && m_table->verticalScrollBar()->isVisible();
+    const int chromeW = (m_table->viewport() && m_table->viewport()->width() > 0)
+        ? (width() - m_table->viewport()->width() + (sbVisible ? 0 : sbW))
+        : (sbW + m_table->frameWidth() * 2 + 36);
+    const int neededW = totalColsWidth + chromeW + 4;
     if (neededW <= width()) return;
 
     QScreen* scr = screen();
     if (!scr) scr = QGuiApplication::primaryScreen();
     if (!scr) return;
-    const int maxAllowedW = scr->availableGeometry().width() - 48;
+    const int maxAllowedW = scr->availableGeometry().width() - 32;
     if (maxAllowedW > width()) {
-        resize(qMin(neededW, maxAllowedW), height());
+        const int targetW = qMin(neededW, maxAllowedW);
+        m_expectedWindowSize = QSize(targetW, height());
+        QScopedValueRollback<bool> guard(m_programmaticResize, true);
+        resize(m_expectedWindowSize);
     }
 }
 
@@ -539,13 +599,13 @@ int MainWindow::computeColumnFitWidth(int col) const
     QHeaderView* hdr = m_table->horizontalHeader();
     hdr->ensurePolished();
 
-    const int markReserve = m_table->isSortingEnabled()
+    const int markReserve = (m_table->isSortingEnabled() && hdr->sortIndicatorSection() == col)
         ? qMax(14, m_table->style()->pixelMetric(QStyle::PM_HeaderMarkSize, nullptr, hdr)
                    + m_table->style()->pixelMetric(QStyle::PM_HeaderMargin, nullptr, hdr))
         : 0;
 
     int width = hdr->sectionSizeHint(col);
-    if (m_table->isSortingEnabled() && hdr->sortIndicatorSection() != col) {
+    if (m_table->isSortingEnabled() && hdr->sortIndicatorSection() == col) {
         width += markReserve;
     }
 
@@ -556,12 +616,12 @@ int MainWindow::computeColumnFitWidth(int col) const
             hf.setBold(true);
             const QFontMetrics hfm(hf);
             const int hTextW = qMax(hfm.horizontalAdvance(hText), hfm.boundingRect(hText).width());
-            width = qMax(width, hTextW + 19 + markReserve);
+            width = qMax(width, hTextW + 20 + markReserve);
         }
     }
 
     const int focusMargin = qMax(2, m_table->style()->pixelMetric(QStyle::PM_FocusFrameHMargin, nullptr, m_table));
-    const int cellHorizExtra = 16 + 2 * (focusMargin + 1) + 4;
+    const int cellHorizExtra = 16 + 2 * (focusMargin + 1) + 6;
     const QFontMetrics defaultFm(m_table->font());
 
     for (int r = 0; r < m_table->rowCount(); ++r) {
@@ -576,7 +636,7 @@ int MainWindow::computeColumnFitWidth(int col) const
                 lay->invalidate();
                 lay->activate();
             }
-            width = qMax(width, qMax(cw->sizeHint().width(), cw->minimumSizeHint().width()) + 22);
+            width = qMax(width, qMax(cw->sizeHint().width(), cw->minimumSizeHint().width()) + 16);
         }
 
         if (const QTableWidgetItem* item = m_table->item(r, col)) {
@@ -589,6 +649,11 @@ int MainWindow::computeColumnFitWidth(int col) const
                 width = qMax(width, textW + cellHorizExtra);
             }
         }
+    }
+
+    if (col < 7 && m_table->rowCount() > 0) {
+        const int viewHint = static_cast<const QAbstractItemView*>(m_table)->sizeHintForColumn(col);
+        width = qMax(width, viewHint + 6);
     }
 
     return qMax(width, hdr->minimumSectionSize());
@@ -688,8 +753,8 @@ void MainWindow::rebuildTable()
     const int startW = qMax(btnFm.horizontalAdvance(startTxt), btnFm.boundingRect(startTxt).width());
     const int stopW = qMax(btnFm.horizontalAdvance(stopTxt), btnFm.boundingRect(stopTxt).width());
     const int editW = qMax(btnFm.horizontalAdvance(editTxt), btnFm.boundingRect(editTxt).width());
-    const int toggleBtnW = qMax(startW, stopW) + 28; // 20px QSS padding + 2px border + 6px cushion
-    const int editBtnW = editW + 28;
+    const int toggleBtnW = qMax(startW, stopW) + 24; // 20px QSS padding + 2px border + 2px cushion
+    const int editBtnW = editW + 24;
 
     for (int r = 0; r < profiles.size(); ++r) {
         const WorkerProfile& p = profiles[r];
@@ -748,8 +813,7 @@ void MainWindow::rebuildTable()
         m_table->setItem(r, 2, new NumericSortItem(tgtStr));
 
         // Col 3: Coinbase Address
-        QTableWidgetItem* itAddr = new NumericSortItem(
-            p.coinbaseAddress.isEmpty() ? QStringLiteral("—") : p.coinbaseAddress);
+        QTableWidgetItem* itAddr = new NumericSortItem(formatTableAddress(p.coinbaseAddress));
         itAddr->setToolTip(p.coinbaseAddress);
         m_table->setItem(r, 3, itAddr);
 
@@ -818,8 +882,9 @@ void MainWindow::rebuildTable()
         actBox->setObjectName(QStringLiteral("rowActionCell"));
         actBox->setAutoFillBackground(false);
         QHBoxLayout* actLay = new QHBoxLayout(actBox);
-        actLay->setContentsMargins(2, 0, 2, 0);
+        actLay->setContentsMargins(4, 0, 4, 0);
         actLay->setSpacing(4);
+        actLay->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
 
         const QString id = p.id;
         QPushButton* bToggle = new QPushButton(isRunning ? stopTxt : startTxt, actBox);
@@ -835,7 +900,7 @@ void MainWindow::rebuildTable()
         QPushButton* bRestart = new QPushButton(QStringLiteral("↻"), actBox);
         bRestart->setToolTip(KTr(QStringLiteral("act.restart")));
         bRestart->setProperty("compact", QStringLiteral("icon"));
-        bRestart->setFixedSize(28, 26);
+        bRestart->setFixedSize(26, 26);
         bRestart->setFocusPolicy(Qt::NoFocus);
         connect(bRestart, &QPushButton::clicked, this, [this, id]() { m_controller->restartWorker(id); });
 
@@ -849,7 +914,7 @@ void MainWindow::rebuildTable()
         bDel->setToolTip(KTr(QStringLiteral("act.delete")));
         bDel->setProperty("compact", QStringLiteral("icon"));
         bDel->setProperty("role", QStringLiteral("deleteIcon"));
-        bDel->setFixedSize(28, 26);
+        bDel->setFixedSize(26, 26);
         bDel->setFocusPolicy(Qt::NoFocus);
         connect(bDel, &QPushButton::clicked, this, [this, id]() { onDeleteWorker(id); });
 
@@ -873,6 +938,9 @@ void MainWindow::rebuildTable()
     }
     fitTableColumnsToContents(/*allowShrink=*/!m_initialColumnFitDone || structureChanged);
     m_table->setUpdatesEnabled(true);
+    if (m_initialColumnFitDone && isVisible()) {
+        ensureWindowFitsTable();
+    }
 }
 
 void MainWindow::restoreTableSelection(const QString& targetWorkerId, int preferredCol)
@@ -1224,6 +1292,13 @@ void MainWindow::onStopUnregistered()
         return;
     }
     m_controller->stopUnregisteredOrDeferred();
+}
+
+void MainWindow::onAutoStopDeferredToggled(bool enabled)
+{
+    m_controller->setAutoStopOnDeferred(enabled);
+    QSettings settings(QStringLiteral("KristaTech"), QStringLiteral("MinerManager"));
+    settings.setValue(QStringLiteral("behavior/autoStopDeferred"), enabled);
 }
 
 void MainWindow::onToggleAllInternalGen()

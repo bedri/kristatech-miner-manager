@@ -2,8 +2,10 @@
 
 #include "models.h"
 
+#include <QElapsedTimer>
 #include <QMainWindow>
 #include <QSet>
+#include <QSize>
 #include <QSystemTrayIcon>
 #include <QTimer>
 #include <QVector>
@@ -19,6 +21,7 @@ class QLabel;
 class QLineEdit;
 class QPlainTextEdit;
 class QPushButton;
+class QResizeEvent;
 class QShowEvent;
 class QTableWidget;
 class RpcClient;
@@ -42,6 +45,7 @@ public:
 
 protected:
     void showEvent(QShowEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
     void closeEvent(QCloseEvent* event) override;
 
 private Q_SLOTS:
@@ -56,6 +60,7 @@ private Q_SLOTS:
     void onImportProfiles();
     void onExportProfiles();
     void onToggleTheme();
+    void onAutoStopDeferredToggled(bool enabled);
     void onFilterChanged();
     void onRowSelectionChanged();
     void requestQuit();
@@ -73,7 +78,7 @@ private:
     int computeColumnFitWidth(int col) const;
     void fitTableColumnToContents(int col, bool allowShrink);
     void fitTableColumnsToContents(bool allowShrink);
-    void ensureInitialWindowFitsTable();
+    void ensureWindowFitsTable();
     void restoreTableSelection(const QString& targetWorkerId, int preferredCol);
 
     ConfigStore* m_store{nullptr};
@@ -87,6 +92,10 @@ private:
     bool m_initialColumnFitDone{false};
     bool m_autoResizingColumns{false};
     bool m_rebuildingTable{false};
+    bool m_userResizedWindow{false};
+    bool m_programmaticResize{false};
+    QSize m_expectedWindowSize;
+    QElapsedTimer m_shownTimer;
     QSet<int> m_userResizedColumns;
     QString m_lastProfileSignature;
     int m_statusFilter{0}; // 0=All, 1=Running, 2=Stopped, 3=Warnings
@@ -146,6 +155,7 @@ private:
     QComboBox* m_comboEngineFilter{nullptr};
     QComboBox* m_comboTargetFilter{nullptr};
     QLineEdit* m_editSearch{nullptr};
+    QCheckBox* m_chkAutoStopDeferred{nullptr};
     QLabel* m_lblFilterCount{nullptr};
 
     // Table

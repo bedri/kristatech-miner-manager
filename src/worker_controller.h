@@ -45,6 +45,9 @@ public:
     int countRunningUnregisteredOrDeferred() const;
     int stopUnregisteredOrDeferred();
 
+    bool autoStopOnDeferred() const { return m_autoStopOnDeferred; }
+    void setAutoStopOnDeferred(bool enabled);
+
     void clearWorkerLog(const QString& id);
 
     /** Scans live /proc processes and adopts matching workers without restarting them. */
@@ -69,6 +72,8 @@ Q_SIGNALS:
     void workersChanged();
     void workerLogAppended(const QString& id, const QStringList& newLines);
     void discoveryFinished(int addedCount, int adoptedCount);
+    void autoStopOnDeferredChanged(bool enabled);
+    void workerAutoStopped(const QString& id, const QString& reason);
 
 private Q_SLOTS:
     void onLogPollTick();
@@ -78,8 +83,11 @@ private:
     int indexOfId(const QString& id) const;
     QString makeUniqueId(const QString& base) const;
     bool matchesProcess(const WorkerProfile& p, const DiscoveredProcess& dp) const;
+    bool isWorkerRunning(const WorkerProfile& p, const WorkerRuntime& rt) const;
+    void autoStopIfDeferred(const QString& id);
 
     void startLocalOrPodman(const WorkerProfile& p, WorkerRuntime& rt);
+    void launchLocalOrPodmanWithPid(const WorkerProfile& p, WorkerRuntime& rt, const QString& exePath, qint64 podPid);
     void startRemoteSsh(const WorkerProfile& p, WorkerRuntime& rt);
     void stopRemoteSsh(const WorkerProfile& p, WorkerRuntime& rt);
     void attachSshLogTail(const WorkerProfile& p);
@@ -92,7 +100,9 @@ private:
     QVector<WorkerProfile> m_profiles;
     QHash<QString, WorkerRuntime> m_runtimes;
     QHash<QString, QProcess*> m_sshTailProcs;
+    QHash<QString, QProcess*> m_podmanStartProcs;
     QTimer m_logTimer;
     QTimer m_healthTimer;
     int m_healthTickCounter{0};
+    bool m_autoStopOnDeferred{false};
 };

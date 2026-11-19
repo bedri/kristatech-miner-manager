@@ -26,6 +26,7 @@ int main(int argc, char* argv[])
 
     QSettings settings(QStringLiteral("KristaTech"), QStringLiteral("MinerManager"));
     const bool isLight = settings.value(QStringLiteral("ui/lightTheme"), false).toBool();
+    const bool autoStopDeferred = settings.value(QStringLiteral("behavior/autoStopDeferred"), false).toBool();
     app.setStyleSheet(Theme::buildStylesheet(isLight));
 
     const QString smokeDir = QDir(QDir::tempPath()).filePath(
@@ -33,6 +34,7 @@ int main(int argc, char* argv[])
     ConfigStore store(smokeTest ? smokeDir : QString());
     RpcClient rpc;
     WorkerController controller(&store, &rpc);
+    controller.setAutoStopOnDeferred(autoStopDeferred);
     controller.loadInitialState(/*autoDiscoverIfEmpty=*/!smokeTest);
 
     MainWindow win(&store, &rpc, &controller, isLight);

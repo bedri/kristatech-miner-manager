@@ -43,6 +43,53 @@ bool isValidCpuAffinity(const QString& affinity)
     return re.match(affinity.trimmed()).hasMatch();
 }
 
+bool isValidPodmanName(const QString& name)
+{
+    static const QRegularExpression re(QStringLiteral("^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$"));
+    return re.match(name.trimmed()).hasMatch();
+}
+
+#ifndef Q_OS_WIN
+bool inspectPodmanContainer(const QString& podmanBin,
+                            const QString& podName,
+                            bool* runningOut,
+                            qint64* pidOut,
+                            QString* errOut)
+{
+    QProcess proc;
+    proc.start(podmanBin,
+               {QStringLiteral("inspect"), podName,
+                QStringLiteral("--format"), QStringLiteral("{{.State.Running}} {{.State.Pid}}")});
+    if (!proc.waitForFinished(5000)) {
+        if (errOut) {
+            *errOut = QStringLiteral("podman inspect timed out");
+        }
+        return false;
+    }
+    if (proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0) {
+        const QString serr = QString::fromUtf8(proc.readAllStandardError()).trimmed();
+        if (errOut) {
+            *errOut = serr.isEmpty() ? QStringLiteral("exit code %1").arg(proc.exitCode()) : serr;
+        }
+        return false;
+    }
+    const QString out = QString::fromUtf8(proc.readAllStandardOutput()).trimmed();
+    const QStringList parts = out.split(QRegularExpression(QStringLiteral("\\s+")), Qt::SkipEmptyParts);
+    if (parts.size() < 2) {
+        if (errOut) {
+            *errOut = QStringLiteral("Unexpected podman inspect output: ") + out;
+        }
+        return false;
+    }
+    const bool running = (parts[0].compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0);
+    bool okPid = false;
+    const qint64 pid = parts[1].toLongLong(&okPid);
+    if (runningOut) *runningOut = running;
+    if (pidOut) *pidOut = okPid ? pid : 0;
+    return true;
+}
+#endif
+
 #ifdef Q_OS_WIN
 DWORD_PTR parseCpuAffinityMask(const QString& spec)
 {
@@ -136,6 +183,19 @@ WorkerController::WorkerController(ConfigStore* store, RpcClient* rpc, QObject* 
 WorkerController::~WorkerController()
 {
     detachSshLogTail(QString());
+    for (QProcess* proc : m_podmanStartProcs) {
+        if (proc) {
+            proc->disconnect(this);
+            if (proc->state() != QProcess::NotRunning) {
+                proc->terminate();
+                if (!proc->waitForFinished(300)) {
+                    proc->kill();
+                    proc->waitForFinished(300);
+                }
+            }
+        }
+    }
+    m_podmanStartProcs.clear();
 }
 
 WorkerProfile WorkerController::profileById(const QString& id) const
@@ -240,6 +300,7 @@ bool WorkerController::removeProfile(const QString& id, bool stopIfRunning)
     if (stopIfRunning && rt.pid > 0 && m_profiles[idx].targetType != TargetType::RemoteSsh) {
         stopWorker(id);
     }
+    m_podmanStartProcs.take(id);
     detachSshLogTail(id);
     QFile::remove(m_store->runtimeJsonPath(id));
     m_profiles.removeAt(idx);
@@ -316,6 +377,7 @@ void WorkerController::startWorker(const QString& id)
 {
     const int idx = indexOfId(id);
     if (idx < 0) return;
+    if (m_podmanStartProcs.contains(id)) return;
 
     const WorkerProfile& p = m_profiles[idx];
     WorkerRuntime& rt = m_runtimes[id];
@@ -326,10 +388,6 @@ void WorkerController::startWorker(const QString& id)
     rt.startedAtEpochMs = QDateTime::currentMSecsSinceEpoch();
     if (rt.logFilePath.isEmpty()) {
         rt.logFilePath = m_store->defaultLogPath(p.id);
-    }
-
-    if (p.disableInternalGenOnStart && m_rpc && p.targetType != TargetType::RemoteSsh) {
-        m_rpc->setInternalGenerate(p, false, nullptr);
     }
 
     if (p.targetType == TargetType::RemoteSsh) {
@@ -360,6 +418,150 @@ void WorkerController::startLocalOrPodman(const WorkerProfile& p, WorkerRuntime&
         return;
     }
 
+    const QString logPath = m_store->defaultLogPath(p.id);
+    rt.logFilePath = logPath;
+    if (!QFileInfo::exists(logPath)) {
+        ConfigStore::writeFile0600(logPath, QByteArray());
+    }
+    const QFileInfo logInfo(logPath);
+    rt.logReadOffset = logInfo.exists() ? logInfo.size() : 0;
+
+#ifdef Q_OS_WIN
+    if (p.targetType == TargetType::PodmanContainer) {
+        rt.status = WorkerStatus::Error;
+        rt.lastError = QStringLiteral("Podman container targets are only supported on Linux hosts.");
+        appendSanitizedLines(p.id, rt, {QStringLiteral("[KMM] ERROR: ") + rt.lastError});
+        return;
+    }
+    launchLocalOrPodmanWithPid(p, rt, exePath, 0);
+#else
+    if (p.targetType != TargetType::PodmanContainer) {
+        launchLocalOrPodmanWithPid(p, rt, exePath, 0);
+        return;
+    }
+
+    const QString podName = p.podmanName.trimmed();
+    if (!isValidPodmanName(podName)) {
+        rt.status = WorkerStatus::Error;
+        rt.lastError = QStringLiteral("Invalid Podman container name: ") + podName;
+        appendSanitizedLines(p.id, rt, {QStringLiteral("[KMM] ERROR: ") + rt.lastError});
+        return;
+    }
+
+    const QString podmanBin = QStandardPaths::findExecutable(QStringLiteral("podman"));
+    if (podmanBin.isEmpty()) {
+        rt.status = WorkerStatus::Error;
+        rt.lastError = QStringLiteral("podman executable not found in PATH");
+        appendSanitizedLines(p.id, rt, {QStringLiteral("[KMM] ERROR: ") + rt.lastError});
+        return;
+    }
+
+    bool running = false;
+    qint64 podPid = 0;
+    QString inspectErr;
+    if (!inspectPodmanContainer(podmanBin, podName, &running, &podPid, &inspectErr)) {
+        rt.status = WorkerStatus::Error;
+        rt.lastError = QStringLiteral("Podman inspect failed for %1: %2").arg(podName, inspectErr);
+        appendSanitizedLines(p.id, rt, {QStringLiteral("[KMM] ERROR: ") + rt.lastError});
+        return;
+    }
+
+    if (running && podPid > 0) {
+        launchLocalOrPodmanWithPid(p, rt, exePath, podPid);
+        return;
+    }
+
+    rt.status = WorkerStatus::Starting;
+    appendSanitizedLines(p.id, rt,
+                         {QStringLiteral("[KMM] Podman container '%1' is stopped; starting container...").arg(podName)});
+
+    QProcess* startProc = new QProcess(this);
+    m_podmanStartProcs.insert(p.id, startProc);
+
+    const QString workerId = p.id;
+    connect(startProc, &QProcess::errorOccurred, this,
+            [this, startProc, workerId, podName](QProcess::ProcessError err) {
+                if (err != QProcess::FailedToStart) return;
+                if (m_podmanStartProcs.value(workerId) != startProc) {
+                    startProc->deleteLater();
+                    return;
+                }
+                m_podmanStartProcs.remove(workerId);
+                startProc->deleteLater();
+
+                if (indexOfId(workerId) < 0 || !m_runtimes.contains(workerId)) return;
+                WorkerRuntime& curRt = m_runtimes[workerId];
+                if (curRt.userStopped) return;
+
+                curRt.status = WorkerStatus::Error;
+                curRt.lastError = QStringLiteral("Failed to launch podman start %1: %2")
+                    .arg(podName, startProc->errorString());
+                appendSanitizedLines(workerId, curRt, {QStringLiteral("[KMM] ERROR: ") + curRt.lastError});
+                Q_EMIT workersChanged();
+            });
+
+    connect(startProc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
+            [this, startProc, workerId, podName, podmanBin, exePath](int exitCode, QProcess::ExitStatus exitStatus) {
+                if (m_podmanStartProcs.value(workerId) != startProc) {
+                    startProc->deleteLater();
+                    return;
+                }
+                m_podmanStartProcs.remove(workerId);
+                startProc->deleteLater();
+
+                const int curIdx = indexOfId(workerId);
+                if (curIdx < 0 || !m_runtimes.contains(workerId)) return;
+                WorkerRuntime& curRt = m_runtimes[workerId];
+                if (curRt.userStopped) return;
+
+                if (exitStatus != QProcess::NormalExit || exitCode != 0) {
+                    const QString serr = QString::fromUtf8(startProc->readAllStandardError()).trimmed();
+                    const QString sout = QString::fromUtf8(startProc->readAllStandardOutput()).trimmed();
+                    const QString detail = !serr.isEmpty() ? serr
+                        : (!sout.isEmpty() ? sout : QStringLiteral("exit code %1").arg(exitCode));
+                    curRt.status = WorkerStatus::Error;
+                    curRt.lastError = QStringLiteral("podman start %1 failed: %2").arg(podName, detail);
+                    appendSanitizedLines(workerId, curRt, {QStringLiteral("[KMM] ERROR: ") + curRt.lastError});
+                    Q_EMIT workersChanged();
+                    return;
+                }
+
+                appendSanitizedLines(workerId, curRt,
+                                     {QStringLiteral("[KMM] Podman container '%1' started.").arg(podName)});
+
+                bool nowRunning = false;
+                qint64 newPid = 0;
+                QString reInspectErr;
+                if (!inspectPodmanContainer(podmanBin, podName, &nowRunning, &newPid, &reInspectErr)
+                    || !nowRunning || newPid <= 0) {
+                    curRt.status = WorkerStatus::Error;
+                    curRt.lastError = QStringLiteral("Podman container '%1' started but is not running (PID %2): %3")
+                        .arg(podName)
+                        .arg(newPid)
+                        .arg(reInspectErr);
+                    appendSanitizedLines(workerId, curRt, {QStringLiteral("[KMM] ERROR: ") + curRt.lastError});
+                    Q_EMIT workersChanged();
+                    return;
+                }
+
+                const WorkerProfile curProfile = m_profiles[curIdx];
+                launchLocalOrPodmanWithPid(curProfile, curRt, exePath, newPid);
+                Q_EMIT workersChanged();
+            });
+
+    startProc->start(podmanBin, {QStringLiteral("start"), podName});
+#endif
+}
+
+void WorkerController::launchLocalOrPodmanWithPid(const WorkerProfile& p,
+                                                  WorkerRuntime& rt,
+                                                  const QString& exePath,
+                                                  qint64 podPid)
+{
+    if (p.disableInternalGenOnStart && m_rpc && p.targetType != TargetType::RemoteSsh) {
+        m_rpc->setInternalGenerate(p, false, nullptr);
+    }
+
     const RpcCredentials creds = ConfigStore::resolveCredentials(p);
     if (!creds.valid) {
         rt.status = WorkerStatus::Error;
@@ -377,13 +579,11 @@ void WorkerController::startLocalOrPodman(const WorkerProfile& p, WorkerRuntime&
         return;
     }
 
-    const QString logPath = m_store->defaultLogPath(p.id);
+    const QString logPath = rt.logFilePath.isEmpty() ? m_store->defaultLogPath(p.id) : rt.logFilePath;
     rt.logFilePath = logPath;
     if (!QFileInfo::exists(logPath)) {
         ConfigStore::writeFile0600(logPath, QByteArray());
     }
-    QFileInfo logInfo(logPath);
-    rt.logReadOffset = logInfo.exists() ? logInfo.size() : 0;
 
     QStringList minerCmdArgs;
     minerCmdArgs << exePath << QStringLiteral("-c") << cfgPath;
@@ -395,6 +595,7 @@ void WorkerController::startLocalOrPodman(const WorkerProfile& p, WorkerRuntime&
     QStringList fullArgs;
 
 #ifdef Q_OS_WIN
+    Q_UNUSED(podPid);
     if (p.targetType == TargetType::PodmanContainer) {
         rt.status = WorkerStatus::Error;
         rt.lastError = QStringLiteral("Podman container targets are only supported on Linux hosts.");
@@ -405,22 +606,16 @@ void WorkerController::startLocalOrPodman(const WorkerProfile& p, WorkerRuntime&
     fullArgs = minerCmdArgs;
 #else
     if (p.targetType == TargetType::PodmanContainer) {
-        qint64 podPid = 0;
-        const QVector<PodmanContainerInfo> pods = ProcessScanner::discoverPodmanContainers();
-        for (const PodmanContainerInfo& pod : pods) {
-            if (pod.name == p.podmanName.trimmed() && pod.running && pod.pid > 0) {
-                podPid = pod.pid;
-                break;
-            }
-        }
         if (podPid <= 0) {
             rt.status = WorkerStatus::Error;
             rt.lastError = QStringLiteral("Podman container is not running: ") + p.podmanName;
             appendSanitizedLines(p.id, rt, {QStringLiteral("[KMM] ERROR: ") + rt.lastError});
             return;
         }
+        const QString podmanBin = QStandardPaths::findExecutable(QStringLiteral("podman"));
         QStringList inner = {
-            QStringLiteral("podman"), QStringLiteral("unshare"), QStringLiteral("nsenter"),
+            podmanBin.isEmpty() ? QStringLiteral("podman") : podmanBin,
+            QStringLiteral("unshare"), QStringLiteral("nsenter"),
             QStringLiteral("-t"), QString::number(podPid), QStringLiteral("-n")
         };
         inner << minerCmdArgs;
@@ -674,6 +869,7 @@ void WorkerController::stopWorker(const QString& id)
     const int idx = indexOfId(id);
     if (idx < 0) return;
 
+    m_podmanStartProcs.take(id);
     const WorkerProfile& p = m_profiles[idx];
     WorkerRuntime& rt = m_runtimes[id];
     rt.userStopped = true;
@@ -734,7 +930,9 @@ void WorkerController::startAll()
 {
     for (const WorkerProfile& p : m_profiles) {
         if (!p.enabled) continue;
+        if (m_podmanStartProcs.contains(p.id)) continue;
         const WorkerRuntime& rt = m_runtimes.value(p.id);
+        if (rt.status == WorkerStatus::Starting) continue;
         if (rt.pid <= 0 || rt.status == WorkerStatus::Stopped || rt.status == WorkerStatus::Error) {
             startWorker(p.id);
         }
@@ -800,6 +998,62 @@ int WorkerController::stopUnregisteredOrDeferred()
         stopWorker(id);
     }
     return ids.size();
+}
+
+bool WorkerController::isWorkerRunning(const WorkerProfile& p, const WorkerRuntime& rt) const
+{
+    if (rt.status == WorkerStatus::Stopped || rt.status == WorkerStatus::Error) {
+        return false;
+    }
+    if (p.targetType == TargetType::RemoteSsh) {
+        return !rt.userStopped;
+    }
+    return rt.pid > 0 || rt.status == WorkerStatus::Starting || rt.status == WorkerStatus::Restarting;
+}
+
+void WorkerController::autoStopIfDeferred(const QString& id)
+{
+    if (!m_autoStopOnDeferred) return;
+    const int idx = indexOfId(id);
+    if (idx < 0 || !m_runtimes.contains(id)) return;
+    const WorkerProfile p = m_profiles[idx];
+    const WorkerRuntime& rt = m_runtimes[id];
+    if (!rt.warningDeferred || !isWorkerRunning(p, rt)) {
+        return;
+    }
+    if (m_rpc && !p.coinbaseAddress.trimmed().isEmpty()) {
+        const PoolSeatInfo seat = m_rpc->seatInfoForAddress(p.coinbaseAddress.trimmed());
+        if (seat.known && seat.registered) {
+            return;
+        }
+    }
+
+    const QString reason = rt.warningDeferredMsg.isEmpty()
+        ? QStringLiteral("ADAM Auto-Register deferred")
+        : rt.warningDeferredMsg;
+    stopWorker(id);
+    appendSanitizedLines(id, m_runtimes[id],
+                         {QStringLiteral("[KMM] Auto-stopped (Auto-Register Deferred): ") + reason});
+    Q_EMIT workerAutoStopped(id, reason);
+}
+
+void WorkerController::setAutoStopOnDeferred(bool enabled)
+{
+    if (m_autoStopOnDeferred == enabled) {
+        return;
+    }
+    m_autoStopOnDeferred = enabled;
+    Q_EMIT autoStopOnDeferredChanged(enabled);
+    if (enabled) {
+        QStringList ids;
+        ids.reserve(m_profiles.size());
+        for (const WorkerProfile& p : m_profiles) {
+            ids.append(p.id);
+        }
+        for (const QString& id : ids) {
+            autoStopIfDeferred(id);
+        }
+    }
 }
 
 void WorkerController::clearWorkerLog(const QString& id)
@@ -1016,6 +1270,10 @@ void WorkerController::appendSanitizedLines(const QString& id, WorkerRuntime& rt
     if (!appended.isEmpty()) {
         Q_EMIT workerLogAppended(id, appended);
     }
+    if (m_autoStopOnDeferred && rt.warningDeferred && !rt.userStopped
+        && rt.status != WorkerStatus::Stopped && rt.status != WorkerStatus::Error) {
+        autoStopIfDeferred(id);
+    }
 }
 
 void WorkerController::readLogIncremental(const QString& id, WorkerRuntime& rt, qint64 tailWindowBytes)
@@ -1050,7 +1308,9 @@ void WorkerController::onLogPollTick()
     for (const WorkerProfile& p : m_profiles) {
         if (p.targetType == TargetType::RemoteSsh) continue;
         WorkerRuntime& rt = m_runtimes[p.id];
-        if (rt.pid <= 0 && rt.status == WorkerStatus::Stopped) continue;
+        if (rt.pid <= 0 && (rt.status == WorkerStatus::Stopped
+                            || rt.status == WorkerStatus::Starting
+                            || rt.status == WorkerStatus::Error)) continue;
         const qint64 prevOff = rt.logReadOffset;
         readLogIncremental(p.id, rt, /*tailWindowBytes=*/24576);
         if (rt.logReadOffset != prevOff) {
@@ -1215,6 +1475,13 @@ void WorkerController::parseLogLine(const QString& sanitizedLine, WorkerRuntime&
     if (const auto m = reDeferred.match(sanitizedLine); m.hasMatch()) {
         rt.warningDeferred = true;
         rt.warningDeferredMsg = m.captured(1).trimmed();
+    }
+    static const QRegularExpression reRegActive(
+        QStringLiteral("ADAM Auto-Register:.*(?:is active in ADAM pool|registered successfully)"),
+        QRegularExpression::CaseInsensitiveOption);
+    if (reRegActive.match(sanitizedLine).hasMatch()) {
+        rt.warningDeferred = false;
+        rt.warningDeferredMsg.clear();
     }
 
     // CPU temp

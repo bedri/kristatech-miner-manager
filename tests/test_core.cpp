@@ -3,6 +3,7 @@
 #include "process_scanner.h"
 #include "worker_controller.h"
 
+#include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -21,6 +22,8 @@ private Q_SLOTS:
     void testProfileRoundtripAndPermissions();
     void testParseLogLine();
     void testParseCmdlineAndSplitArgs();
+    void testAutoStopOnDeferred();
+    void testAutoStartStoppedPodmanContainer();
 };
 
 void TestCore::testParseKristaTechConf()
@@ -175,6 +178,10 @@ void TestCore::testParseLogLine()
     QVERIFY(rt.warningDeferred);
     QVERIFY(rt.warningDeferredMsg.contains(QStringLiteral("active seat")));
 
+    WorkerController::parseLogLine(QStringLiteral("ADAM Auto-Register: Miner KTLht4hN is active in ADAM pool. Next check in 30m."), rt);
+    QVERIFY(!rt.warningDeferred);
+    QVERIFY(rt.warningDeferredMsg.isEmpty());
+
     WorkerController::parseLogLine(QStringLiteral("ADAM miner: Waiting for next block or election..."), rt);
     QCOMPARE(rt.status, WorkerStatus::Waiting);
 
@@ -220,6 +227,212 @@ void TestCore::testParseCmdlineAndSplitArgs()
     QCOMPARE(split.size(), 2);
     QCOMPARE(split[0], QStringLiteral("-q"));
     QCOMPARE(split[1], QStringLiteral("--coinbase-sig=KristaTech Node"));
+}
+
+void TestCore::testAutoStopOnDeferred()
+{
+#ifndef Q_OS_WIN
+    QTemporaryDir tmpDir;
+    QVERIFY(tmpDir.isValid());
+
+    const QString mockMiner = tmpDir.filePath(QStringLiteral("mock_deferred_miner.sh"));
+    {
+        QFile f(mockMiner);
+        QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        f.write("#!/bin/sh\n"
+                "echo \"[2026-11-20 00:22:04] ADAM Auto-Register deferred: This wallet already holds an active 10-KRISTA PoW-Lock seat\"\n"
+                "exec sleep 30\n");
+        f.close();
+        QVERIFY(f.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner
+                                 | QFileDevice::ReadGroup | QFileDevice::ExeGroup
+                                 | QFileDevice::ReadOther | QFileDevice::ExeOther));
+    }
+
+    ConfigStore store(tmpDir.filePath(QStringLiteral("cfg")));
+    RpcClient rpc;
+    WorkerController controller(&store, &rpc);
+    controller.loadInitialState(/*autoDiscoverIfEmpty=*/false);
+    QCOMPARE(controller.autoStopOnDeferred(), false);
+
+    WorkerProfile p;
+    p.id = QStringLiteral("mock_def_1");
+    p.name = QStringLiteral("Mock Deferred");
+    p.engine = MinerEngine::CpuMiner;
+    p.binaryPath = mockMiner;
+    p.targetType = TargetType::CustomRpc;
+    p.rpcUrl = QStringLiteral("http://127.0.0.1:27998/");
+    p.rpcUser = QStringLiteral("u");
+    p.rpcPassword = QStringLiteral("p");
+    p.coinbaseAddress = QStringLiteral("KTLht4hN");
+    controller.addProfile(p);
+
+    QSignalSpy autoStoppedSpy(&controller, &WorkerController::workerAutoStopped);
+
+    // 1. Default OFF: worker emits deferred warning in log but continues running
+    controller.startWorker(p.id);
+    QTRY_VERIFY_WITH_TIMEOUT(controller.runtimeById(p.id).warningDeferred, 4000);
+    const WorkerRuntime rtWhileRunning = controller.runtimeById(p.id);
+    QVERIFY(rtWhileRunning.pid > 0);
+    QVERIFY(rtWhileRunning.status != WorkerStatus::Stopped);
+    QCOMPARE(autoStoppedSpy.count(), 0);
+
+    // 2. Enabling Auto-Stop Deferred immediately stops currently deferred running worker
+    controller.setAutoStopOnDeferred(true);
+    QCOMPARE(controller.autoStopOnDeferred(), true);
+    const WorkerRuntime rtAfterToggle = controller.runtimeById(p.id);
+    QCOMPARE(rtAfterToggle.status, WorkerStatus::Stopped);
+    QCOMPARE(rtAfterToggle.pid, qint64(0));
+    QCOMPARE(rtAfterToggle.userStopped, true);
+    QCOMPARE(rtAfterToggle.warningDeferred, true);
+    QCOMPARE(autoStoppedSpy.count(), 1);
+    QVERIFY(rtAfterToggle.logLines.join(QLatin1Char('\n')).contains(QStringLiteral("[KMM] Auto-stopped (Auto-Register Deferred)")));
+
+    // 3. Starting while enabled auto-stops automatically once log line is polled
+    QTest::qWait(100);
+    controller.startWorker(p.id);
+    QTRY_COMPARE_WITH_TIMEOUT(autoStoppedSpy.count(), 2, 4000);
+    const WorkerRuntime rtAfterRestart = controller.runtimeById(p.id);
+    QCOMPARE(rtAfterRestart.status, WorkerStatus::Stopped);
+    QCOMPARE(rtAfterRestart.userStopped, true);
+
+    controller.stopWorker(p.id);
+#else
+    QSKIP("POSIX shell mock process test skipped on Windows");
+#endif
+}
+
+void TestCore::testAutoStartStoppedPodmanContainer()
+{
+#ifndef Q_OS_WIN
+    QTemporaryDir tmpDir;
+    QVERIFY(tmpDir.isValid());
+
+    const QString binDir = tmpDir.filePath(QStringLiteral("bin"));
+    QVERIFY(QDir().mkpath(binDir));
+
+    const QString stateFile = tmpDir.filePath(QStringLiteral("pod_running"));
+    const QString startLog = tmpDir.filePath(QStringLiteral("started.log"));
+    const QString fakePodman = binDir + QStringLiteral("/podman");
+    {
+        QFile f(fakePodman);
+        QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        const QByteArray script = QStringLiteral(
+            "#!/bin/sh\n"
+            "STATE_FILE=\"%1\"\n"
+            "LOG_FILE=\"%2\"\n"
+            "cmd=\"$1\"\n"
+            "case \"$cmd\" in\n"
+            "  inspect)\n"
+            "    if [ -f \"$STATE_FILE\" ]; then\n"
+            "      echo \"true 42424\"\n"
+            "    else\n"
+            "      echo \"false 0\"\n"
+            "    fi\n"
+            "    exit 0\n"
+            "    ;;\n"
+            "  start)\n"
+            "    echo \"$2\" >> \"$LOG_FILE\"\n"
+            "    touch \"$STATE_FILE\"\n"
+            "    exit 0\n"
+            "    ;;\n"
+            "  exec)\n"
+            "    if [ ! -f \"$STATE_FILE\" ]; then\n"
+            "      echo \"Error: can only create exec sessions on running containers: container state improper\" >&2\n"
+            "      exit 125\n"
+            "    fi\n"
+            "    cat <<'EOF'\n"
+            "rpcuser=poduser\n"
+            "rpcpassword=podpass\n"
+            "rpcport=27979\n"
+            "EOF\n"
+            "    exit 0\n"
+            "    ;;\n"
+            "  unshare)\n"
+            "    shift 5\n"
+            "    exec \"$@\"\n"
+            "    ;;\n"
+            "  *)\n"
+            "    echo \"unexpected podman cmd: $*\" >&2\n"
+            "    exit 2\n"
+            "    ;;\n"
+            "esac\n").arg(stateFile, startLog).toUtf8();
+        f.write(script);
+        f.close();
+        QVERIFY(f.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner
+                                 | QFileDevice::ReadGroup | QFileDevice::ExeGroup
+                                 | QFileDevice::ReadOther | QFileDevice::ExeOther));
+    }
+
+    const QString mockMiner = tmpDir.filePath(QStringLiteral("mock_podman_miner.sh"));
+    {
+        QFile f(mockMiner);
+        QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        f.write("#!/bin/sh\n"
+                "echo \"[2026-11-20 01:00:00] ADAM miner: Waiting for next block or election...\"\n"
+                "exec sleep 30\n");
+        f.close();
+        QVERIFY(f.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner
+                                 | QFileDevice::ReadGroup | QFileDevice::ExeGroup
+                                 | QFileDevice::ReadOther | QFileDevice::ExeOther));
+    }
+
+    const QByteArray origPath = qgetenv("PATH");
+    struct PathRestorer {
+        QByteArray orig;
+        ~PathRestorer() { qputenv("PATH", orig); }
+    } restorePath{origPath};
+    qputenv("PATH", binDir.toUtf8() + ':' + origPath);
+
+    ConfigStore store(tmpDir.filePath(QStringLiteral("cfg")));
+    RpcClient rpc;
+    WorkerController controller(&store, &rpc);
+    controller.loadInitialState(/*autoDiscoverIfEmpty=*/false);
+
+    WorkerProfile p;
+    p.id = QStringLiteral("pod_test_1");
+    p.name = QStringLiteral("Podman Test");
+    p.engine = MinerEngine::CpuMiner;
+    p.binaryPath = mockMiner;
+    p.targetType = TargetType::PodmanContainer;
+    p.podmanName = QStringLiteral("krista-cold-test01");
+    p.coinbaseAddress = QStringLiteral("KTXWGMQ6");
+    p.autoRestart = false;
+    controller.addProfile(p);
+
+    struct StopGuard {
+        WorkerController& c;
+        QString id;
+        ~StopGuard() { c.stopWorker(id); }
+    } stopGuard{controller, p.id};
+
+    controller.startWorker(p.id);
+
+    const WorkerRuntime rtImmediately = controller.runtimeById(p.id);
+    QCOMPARE(rtImmediately.status, WorkerStatus::Starting);
+    QVERIFY(rtImmediately.logLines.join(QLatin1Char('\n'))
+                .contains(QStringLiteral("Podman container 'krista-cold-test01' is stopped; starting container...")));
+
+    QTRY_VERIFY_WITH_TIMEOUT(
+        QFileInfo::exists(stateFile)
+        && controller.runtimeById(p.id).pid > 0
+        && (controller.runtimeById(p.id).status == WorkerStatus::Waiting
+            || controller.runtimeById(p.id).status == WorkerStatus::Solving),
+        4000);
+
+    const WorkerRuntime rtRunning = controller.runtimeById(p.id);
+    const QString fullLog = rtRunning.logLines.join(QLatin1Char('\n'));
+    QVERIFY(fullLog.contains(QStringLiteral("Podman container 'krista-cold-test01' started.")));
+    QVERIFY(fullLog.contains(QStringLiteral("[KMM] Started")));
+
+    QFile logF(startLog);
+    QVERIFY(logF.open(QIODevice::ReadOnly));
+    QCOMPARE(QString::fromUtf8(logF.readAll()).trimmed(), QStringLiteral("krista-cold-test01"));
+
+    controller.stopWorker(p.id);
+    QCOMPARE(controller.runtimeById(p.id).status, WorkerStatus::Stopped);
+#else
+    QSKIP("POSIX shell podman mock test skipped on Windows");
+#endif
 }
 
 QTEST_MAIN(TestCore)

@@ -86,6 +86,10 @@ void I18n::initTable()
     add("filter.engine_all", "All Engines", "Tüm Motorlar");
     add("filter.target_all", "All Targets", "Tüm Hedefler");
     add("filter.search_ph", "Search worker, address, pod, host...", "İşçi, adres, pod veya sunucu ara...");
+    add("opt.auto_stop_deferred", "Auto-Stop Deferred", "Erteleneni Oto-Durdur");
+    add("opt.auto_stop_deferred_tip",
+        "Automatically stop a running worker when ADAM Auto-Register deferred is detected in its log.",
+        "Logda ADAM Auto-Register deferred tespit edildiğinde çalışan işçiyi otomatik olarak durdurur.");
 
     // Table Columns
     add("col.worker", "Worker", "İşçi");

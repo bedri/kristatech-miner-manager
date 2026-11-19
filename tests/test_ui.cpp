@@ -7,6 +7,7 @@
 #include "worker_controller.h"
 
 #include <QApplication>
+#include <QCheckBox>
 #include <QFontMetrics>
 #include <QHeaderView>
 #include <QItemSelectionModel>
@@ -116,6 +117,8 @@ private Q_SLOTS:
     void testSelectionPreservedAcrossTableRefreshAndSorting();
     void testFilterPillsAndWarningsFilter();
     void testToggleInternalGenButtonBidirectional();
+    void testAutoStopDeferredCheckboxAndI18n();
+    void testActionButtonsNotClippedWithVerticalScrollbar();
 
 private:
     QTemporaryDir m_settingsDir;
@@ -634,6 +637,184 @@ void TestUi::testToggleInternalGenButtonBidirectional()
     I18n::instance().setLanguage(I18n::Language::TR);
     QApplication::processEvents();
     QCOMPARE(toggleGenBtn->text(), QStringLiteral("Dahili Kazımı Kapat"));
+}
+
+void TestUi::testAutoStopDeferredCheckboxAndI18n()
+{
+    QTemporaryDir tmpDir;
+    QVERIFY(tmpDir.isValid());
+    QSettings settings(QStringLiteral("KristaTech"), QStringLiteral("MinerManager"));
+    const QVariant prevVal = settings.value(QStringLiteral("behavior/autoStopDeferred"));
+    settings.setValue(QStringLiteral("behavior/autoStopDeferred"), false);
+
+    ConfigStore store(tmpDir.path());
+    RpcClient rpc;
+    WorkerController controller(&store, &rpc);
+    controller.loadInitialState(/*autoDiscoverIfEmpty=*/false);
+
+    I18n::instance().setLanguage(I18n::Language::EN);
+    MainWindow win(&store, &rpc, &controller, false);
+    win.show();
+    QApplication::processEvents();
+
+    QCheckBox* chk = win.findChild<QCheckBox*>(QStringLiteral("chkAutoStopDeferred"));
+    QVERIFY(chk != nullptr);
+    QCOMPARE(chk->isChecked(), false);
+    QCOMPARE(controller.autoStopOnDeferred(), false);
+    QCOMPARE(chk->text(), QStringLiteral("Auto-Stop Deferred"));
+
+    chk->click();
+    QApplication::processEvents();
+    QCOMPARE(chk->isChecked(), true);
+    QCOMPARE(controller.autoStopOnDeferred(), true);
+    QCOMPARE(settings.value(QStringLiteral("behavior/autoStopDeferred")).toBool(), true);
+
+    chk->click();
+    QApplication::processEvents();
+    QCOMPARE(chk->isChecked(), false);
+    QCOMPARE(controller.autoStopOnDeferred(), false);
+    QCOMPARE(settings.value(QStringLiteral("behavior/autoStopDeferred")).toBool(), false);
+
+    controller.setAutoStopOnDeferred(true);
+    QApplication::processEvents();
+    QCOMPARE(chk->isChecked(), true);
+
+    I18n::instance().setLanguage(I18n::Language::TR);
+    QApplication::processEvents();
+    QCOMPARE(chk->text(), QStringLiteral("Erteleneni Oto-Durdur"));
+
+    I18n::instance().setLanguage(I18n::Language::EN);
+    if (prevVal.isValid()) {
+        settings.setValue(QStringLiteral("behavior/autoStopDeferred"), prevVal);
+    } else {
+        settings.remove(QStringLiteral("behavior/autoStopDeferred"));
+    }
+}
+
+void TestUi::testActionButtonsNotClippedWithVerticalScrollbar()
+{
+    QTemporaryDir tmpDir;
+    QVERIFY(tmpDir.isValid());
+
+#ifndef Q_OS_WIN
+    const QString mockMiner = tmpDir.filePath(QStringLiteral("mock_live_miner.sh"));
+    {
+        QFile f(mockMiner);
+        QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        f.write("#!/bin/sh\n"
+                "echo \"[2026-11-20 00:22:04] ADAM Auto-Register deferred: This wallet already holds an active 10-KRISTA PoW-Lock seat\"\n"
+                "echo \"[2026-11-20 00:22:05] New Block 6034, Tx 0, Net Diff 0.001801\"\n"
+                "echo \"[2026-11-20 00:22:06] Miner TTF @ 219.40 kh/s 12s, Net TTF @ 20.00 Mh/s 0s\"\n"
+                "echo \"[2026-11-20 00:22:07] CPU temp: curr 31 C max 33\"\n"
+                "echo \"[2026-11-20 00:22:08] 48 A48 S0 R0 BLOCK SOLVED 48, 12.3 sec (1ms)\"\n"
+                "exec sleep 30\n");
+        f.close();
+        QVERIFY(f.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner
+                                 | QFileDevice::ReadGroup | QFileDevice::ExeGroup
+                                 | QFileDevice::ReadOther | QFileDevice::ExeOther));
+    }
+#endif
+
+    ConfigStore store(tmpDir.filePath(QStringLiteral("cfg")));
+    RpcClient rpc;
+    WorkerController controller(&store, &rpc);
+    controller.loadInitialState(/*autoDiscoverIfEmpty=*/false);
+
+    for (int i = 1; i <= 17; ++i) {
+        WorkerProfile p;
+        p.id = QStringLiteral("worker_%1").arg(i, 2, 10, QLatin1Char('0'));
+        if (i <= 7) {
+            p.name = QStringLiteral("Local cpuminer (KTdHzRF%1)").arg(i);
+            p.targetType = (i == 1) ? TargetType::CustomRpc : TargetType::LocalWallet;
+            if (i == 1) {
+#ifndef Q_OS_WIN
+                p.binaryPath = mockMiner;
+#endif
+                p.rpcUrl = QStringLiteral("http://127.0.0.1:27998/");
+                p.rpcUser = QStringLiteral("u");
+                p.rpcPassword = QStringLiteral("p");
+            } else {
+                p.confPath = QStringLiteral("/home/user/.kristatech/kristatech.conf");
+            }
+        } else {
+            p.name = QStringLiteral("krista-cold-%1 (KTXWGMQ%2)").arg(i - 7, 2, 10, QLatin1Char('0')).arg(i - 7);
+            p.targetType = TargetType::PodmanContainer;
+            p.podmanName = QStringLiteral("krista-cold-%1").arg(i - 7, 2, 10, QLatin1Char('0'));
+        }
+        p.engine = MinerEngine::CpuMiner;
+        p.threads = 1;
+        p.coinbaseAddress = QStringLiteral("KTdHzRF4e71xcU1ea8tePLmZNijUnH%1ZNYm").arg(i, 3, 10, QLatin1Char('0'));
+        controller.addProfile(p);
+    }
+
+    I18n::instance().setLanguage(I18n::Language::EN);
+    MainWindow win(&store, &rpc, &controller, true);
+    win.show();
+    QApplication::processEvents();
+
+    // Simulate live RPC & wide running worker statuses after initial show
+    NodeMiningStatus unreachable;
+    unreachable.checked = true;
+    unreachable.reachable = false;
+    rpc.setTargetStatus(QStringLiteral("local:/home/user/.kristatech/kristatech.conf"), unreachable);
+    rpc.setTargetStatus(QStringLiteral("rpc:http://127.0.0.1:27998/"), unreachable);
+    for (int i = 1; i <= 10; ++i) {
+        rpc.setTargetStatus(QStringLiteral("podman:krista-cold-%1").arg(i, 2, 10, QLatin1Char('0')), unreachable);
+    }
+    Q_EMIT rpc.poolSeatsUpdated();
+
+#ifndef Q_OS_WIN
+    controller.startWorker(QStringLiteral("worker_01"));
+    QTRY_VERIFY_WITH_TIMEOUT(controller.runtimeById(QStringLiteral("worker_01")).hashrateKhs > 200.0
+                             && controller.runtimeById(QStringLiteral("worker_01")).warningDeferred, 4000);
+#endif
+    QApplication::processEvents();
+
+    QTableWidget* table = win.findChild<QTableWidget*>();
+    QVERIFY(table != nullptr);
+
+    auto checkViewportAndButtons = [&](const char* langLabel) {
+        QApplication::processEvents();
+        verifyAllColumnsFit(table);
+
+        // Verify full coinbase address remains searchable & preserved in tooltip even though cell is abbreviated
+        QCOMPARE(table->item(0, 3)->text().contains(QStringLiteral("…")), true);
+        QCOMPARE(table->item(0, 3)->toolTip(), QStringLiteral("KTdHzRF4e71xcU1ea8tePLmZNijUnH001ZNYm"));
+
+        int totalColsWidth = 0;
+        for (int c = 0; c < table->columnCount(); ++c) {
+            totalColsWidth += table->columnWidth(c);
+        }
+        const QByteArray fitMsg = QStringLiteral("[%1] Table totalColsWidth %2 > viewport width %3 (win width %4)")
+            .arg(QLatin1String(langLabel)).arg(totalColsWidth).arg(table->viewport()->width()).arg(win.width()).toUtf8();
+        QVERIFY2(totalColsWidth <= table->viewport()->width(), fitMsg.constData());
+
+        for (int r = 0; r < table->rowCount(); ++r) {
+            QWidget* cw = table->cellWidget(r, 7);
+            QVERIFY(cw != nullptr);
+            QVERIFY2(cw->width() <= table->columnWidth(7),
+                     qPrintable(QStringLiteral("[%1] Row %2 cellWidget width %3 > col 7 width %4")
+                         .arg(QLatin1String(langLabel)).arg(r).arg(cw->width()).arg(table->columnWidth(7))));
+            const auto btns = cw->findChildren<QPushButton*>();
+            QCOMPARE(btns.size(), 4);
+            for (QPushButton* btn : btns) {
+                QVERIFY2(btn->geometry().right() <= cw->width() - 1,
+                         qPrintable(QStringLiteral("[%1] Row %2 button '%3' right %4 overflows cellWidget width %5")
+                             .arg(QLatin1String(langLabel)).arg(r).arg(btn->text())
+                             .arg(btn->geometry().right()).arg(cw->width())));
+            }
+        }
+    };
+
+    checkViewportAndButtons("EN");
+
+    I18n::instance().setLanguage(I18n::Language::TR);
+    checkViewportAndButtons("TR");
+
+    I18n::instance().setLanguage(I18n::Language::EN);
+#ifndef Q_OS_WIN
+    controller.stopWorker(QStringLiteral("worker_01"));
+#endif
 }
 
 QTEST_MAIN(TestUi)
