@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#192A4C"/>
+      <stop offset="48%" stop-color="#0F182D"/>
+      <stop offset="100%" stop-color="#080C17"/>
+    </linearGradient>
+    <linearGradient id="borderGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7695CD"/>
+      <stop offset="55%" stop-color="#5576B2"/>
+      <stop offset="100%" stop-color="#D47B78"/>
+    </linearGradient>
+    <linearGradient id="frameGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7695CD"/>
+      <stop offset="100%" stop-color="#F5897C"/>
+    </linearGradient>
+    <radialGradient id="blueGlow" cx="34%" cy="35%" r="42%">
+      <stop offset="0%" stop-color="#7695CD" stop-opacity="0.26"/>
+      <stop offset="100%" stop-color="#7695CD" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="salmonGlow" cx="65%" cy="62%" r="44%">
+      <stop offset="0%" stop-color="#F5897C" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#F5897C" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="blueBlockGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#92B3EE"/>
+      <stop offset="55%" stop-color="#7695CD"/>
+      <stop offset="100%" stop-color="#5576B2"/>
+    </linearGradient>
+    <linearGradient id="salmonKGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFA59A"/>
+      <stop offset="50%" stop-color="#F5897C"/>
+      <stop offset="100%" stop-color="#DC6B5E"/>
+    </linearGradient>
+    <clipPath id="badgeClip">
+      <rect x="24" y="24" width="464" height="464" rx="108" ry="108"/>
+    </clipPath>
+  </defs>
+
+  <!-- Squircle Badge Base -->
+  <rect x="24" y="24" width="464" height="464" rx="108" ry="108" fill="url(#bgGrad)"/>
+
+  <g clip-path="url(#badgeClip)">
+    <!-- Subtle Crystal Facet Sheen -->
+    <polygon points="24,24 310,24 24,310" fill="#7695CD" fill-opacity="0.06"/>
+    <polygon points="488,488 220,488 488,220" fill="#F5897C" fill-opacity="0.05"/>
+
+    <!-- Ambient Core Glows -->
+    <rect x="24" y="24" width="464" height="464" fill="url(#blueGlow)"/>
+    <rect x="24" y="24" width="464" height="464" fill="url(#salmonGlow)"/>
+
+    <!-- ADAM Consensus Octagonal Compute Frame -->
+    <polygon points="146,56 366,56 456,146 456,366 366,456 146,456 56,366 56,146"
+             fill="none" stroke="url(#frameGrad)" stroke-width="3.5" stroke-opacity="0.34"/>
+
+    <!-- Minimal Hardware / Miner Compute Bus Pins -->
+    <g stroke-width="5.5" stroke-linecap="round">
+      <line x1="224" y1="56" x2="224" y2="36" stroke="#7695CD" stroke-opacity="0.46"/>
+      <line x1="256" y1="56" x2="256" y2="36" stroke="#7695CD" stroke-opacity="0.46"/>
+      <line x1="288" y1="56" x2="288" y2="36" stroke="#7695CD" stroke-opacity="0.46"/>
+
+      <line x1="56" y1="224" x2="36" y2="224" stroke="#7695CD" stroke-opacity="0.46"/>
+      <line x1="56" y1="256" x2="36" y2="256" stroke="#7695CD" stroke-opacity="0.46"/>
+      <line x1="56" y1="288" x2="36" y2="288" stroke="#7695CD" stroke-opacity="0.46"/>
+
+      <line x1="224" y1="456" x2="224" y2="476" stroke="#F5897C" stroke-opacity="0.42"/>
+      <line x1="256" y1="456" x2="256" y2="476" stroke="#F5897C" stroke-opacity="0.42"/>
+      <line x1="288" y1="456" x2="288" y2="476" stroke="#F5897C" stroke-opacity="0.42"/>
+
+      <line x1="456" y1="224" x2="476" y2="224" stroke="#F5897C" stroke-opacity="0.42"/>
+      <line x1="456" y1="256" x2="476" y2="256" stroke="#F5897C" stroke-opacity="0.42"/>
+      <line x1="456" y1="288" x2="476" y2="288" stroke="#F5897C" stroke-opacity="0.42"/>
+    </g>
+
+    <!-- Subtle Inner Rim Highlight -->
+    <rect x="34" y="34" width="444" height="444" rx="98" ry="98"
+          fill="none" stroke="#9BB8EA" stroke-opacity="0.16" stroke-width="2"/>
+  </g>
+
+  <!-- Crisp Outer Badge Border -->
+  <rect x="24" y="24" width="464" height="464" rx="108" ry="108"
+        fill="none" stroke="url(#borderGrad)" stroke-width="8"/>
+
+  <!-- Hero KRISTA Emblem (exact 63x50 brand proportions scaled 5.0x and centered) -->
+  <g transform="translate(98.5, 131) scale(5.0)">
+    <!-- Soft Layered Drop Shadow -->
+    <g transform="translate(0, 1.8)" fill="#040710" fill-opacity="0.48">
+      <rect x="0" y="1" width="11" height="11" rx="0.9"/>
+      <rect x="22" y="1" width="11" height="11" rx="0.9"/>
+      <rect x="11" y="12" width="11" height="11" rx="0.9"/>
+      <path d="M 22 23 L 32.3 23 L 49 0 L 61.5 0 L 44.2 23.8 L 63 50 L 50.2 50 L 33 26.3 L 33 50 L 22 50 Z"/>
+    </g>
+
+    <!-- 3 Slate-Blue Crystal Blocks -->
+    <rect x="0" y="1" width="11" height="11" rx="0.9" fill="url(#blueBlockGrad)"/>
+    <polygon points="0.6,1.6 10.4,1.6 0.6,11.4" fill="#C4DAFF" fill-opacity="0.24"/>
+
+    <rect x="22" y="1" width="11" height="11" rx="0.9" fill="url(#blueBlockGrad)"/>
+    <polygon points="22.6,1.6 32.4,1.6 22.6,11.4" fill="#C4DAFF" fill-opacity="0.24"/>
+
+    <rect x="11" y="12" width="11" height="11" rx="0.9" fill="url(#blueBlockGrad)"/>
+    <polygon points="11.6,12.6 21.4,12.6 11.6,22.4" fill="#C4DAFF" fill-opacity="0.24"/>
+
+    <!-- Signature Salmon-Coral Geometric K -->
+    <path d="M 22 23 L 32.3 23 L 49 0 L 61.5 0 L 44.2 23.8 L 63 50 L 50.2 50 L 33 26.3 L 33 50 L 22 50 Z"
+          fill="url(#salmonKGrad)"/>
+    <path d="M 49 0 L 61.5 0 L 59.8 2.3 L 47.3 2.3 Z" fill="#FFD3CC" fill-opacity="0.30"/>
+  </g>
+</svg>

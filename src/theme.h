@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QIcon>
 #include <QString>
 
 /**
@@ -25,11 +26,17 @@ struct ThemeColors {
     QString warnFg;
     QString dangerBg;
     QString dangerFg;
+    QString subtleBorder;
+    QString warnBorder;
+    QString dangerBorder;
+    QString logBg;
+    QString logFg;
 };
 
 namespace Theme {
 
 ThemeColors colors(bool isLight);
 QString buildStylesheet(bool isLight);
+QIcon appIcon();
 
 } // namespace Theme

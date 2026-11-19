@@ -66,6 +66,12 @@ NodeMiningStatus RpcClient::statusForTarget(const QString& targetKey) const
     return m_targetStatuses.value(targetKey);
 }
 
+void RpcClient::setTargetStatus(const QString& targetKey, const NodeMiningStatus& status)
+{
+    m_targetStatuses.insert(targetKey, status);
+    Q_EMIT targetStatusUpdated(targetKey, status);
+}
+
 PoolSeatInfo RpcClient::seatInfoForAddress(const QString& address) const
 {
     if (m_poolSeats.contains(address)) {
@@ -101,8 +107,7 @@ void RpcClient::refreshTargets(const QVector<WorkerProfile>& profiles)
             st.checked = true;
             st.reachable = false;
             st.error = creds.error;
-            m_targetStatuses.insert(tkey, st);
-            Q_EMIT targetStatusUpdated(tkey, st);
+            setTargetStatus(tkey, st);
             continue;
         }
 
@@ -115,8 +120,7 @@ void RpcClient::refreshTargets(const QVector<WorkerProfile>& profiles)
                       if (!ok || !res.isObject()) {
                           st.reachable = false;
                           st.error = err.isEmpty() ? QStringLiteral("RPC unreachable") : err;
-                          m_targetStatuses.insert(tkey, st);
-                          Q_EMIT targetStatusUpdated(tkey, st);
+                          setTargetStatus(tkey, st);
                           return;
                       }
                       const QJsonObject obj = res.toObject();
@@ -127,8 +131,7 @@ void RpcClient::refreshTargets(const QVector<WorkerProfile>& profiles)
                       st.internalGenerate = obj.value(QStringLiteral("generate")).toBool(false);
                       st.internalThreads = obj.value(QStringLiteral("genproclimit")).toInt(0);
                       st.poolSize = m_poolSeats.size();
-                      m_targetStatuses.insert(tkey, st);
-                      Q_EMIT targetStatusUpdated(tkey, st);
+                      setTargetStatus(tkey, st);
 
                       if (p.targetType != TargetType::RemoteSsh) {
                           fetchPoolIfNeeded(p, creds, st.blockHeight);
@@ -240,9 +243,10 @@ void RpcClient::setInternalGenerate(const WorkerProfile& profile,
                   if (ok) {
                       const QString tkey = profile.targetKey();
                       NodeMiningStatus st = m_targetStatuses.value(tkey);
+                      st.checked = true;
+                      st.reachable = true;
                       st.internalGenerate = enable;
-                      m_targetStatuses.insert(tkey, st);
-                      Q_EMIT targetStatusUpdated(tkey, st);
+                      setTargetStatus(tkey, st);
                   }
                   if (cb) cb(ok, err);
               });

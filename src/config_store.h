@@ -32,6 +32,9 @@ public:
     QByteArray exportProfilesJson(const QVector<WorkerProfile>& profiles, bool redactSecrets = true) const;
     QVector<WorkerProfile> parseImportedProfilesJson(const QByteArray& data, QString* errorOut = nullptr) const;
 
+    /** Platform-appropriate default path to kristatech.conf. */
+    static QString defaultKristaTechConfPath();
+
     /** Resolves credentials live for LocalWallet/PodmanContainer or from profile for CustomRpc. */
     static RpcCredentials resolveCredentials(const WorkerProfile& profile);
 

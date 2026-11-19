@@ -7,19 +7,20 @@
 #include "worker_controller.h"
 
 #include <QApplication>
+#include <QCoreApplication>
 #include <QDir>
+#include <QGuiApplication>
 #include <QIcon>
 #include <QSettings>
-
-#include <unistd.h>
 
 int main(int argc, char* argv[])
 {
     QApplication app(argc, argv);
     app.setApplicationName(QStringLiteral("KristaTechMinerManager"));
     app.setOrganizationName(QStringLiteral("KristaTech"));
+    QGuiApplication::setDesktopFileName(QStringLiteral("kristatech-miner-manager"));
     app.setQuitOnLastWindowClosed(false);
-    app.setWindowIcon(QIcon(QStringLiteral(":/logo.png")));
+    app.setWindowIcon(Theme::appIcon());
 
     const bool smokeTest = app.arguments().contains(QStringLiteral("--smoke-test"));
 
@@ -27,7 +28,8 @@ int main(int argc, char* argv[])
     const bool isLight = settings.value(QStringLiteral("ui/lightTheme"), false).toBool();
     app.setStyleSheet(Theme::buildStylesheet(isLight));
 
-    const QString smokeDir = QStringLiteral("/tmp/kmm_smoke_%1").arg(::getpid());
+    const QString smokeDir = QDir(QDir::tempPath()).filePath(
+        QStringLiteral("kmm_smoke_%1").arg(QCoreApplication::applicationPid()));
     ConfigStore store(smokeTest ? smokeDir : QString());
     RpcClient rpc;
     WorkerController controller(&store, &rpc);

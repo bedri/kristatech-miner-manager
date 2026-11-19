@@ -3,6 +3,7 @@
 #include "models.h"
 
 #include <QMainWindow>
+#include <QSet>
 #include <QSystemTrayIcon>
 #include <QTimer>
 #include <QVector>
@@ -10,6 +11,7 @@
 class ConfigStore;
 class ProcessScanner;
 class QAction;
+class QButtonGroup;
 class QCheckBox;
 class QComboBox;
 class QFrame;
@@ -17,6 +19,7 @@ class QLabel;
 class QLineEdit;
 class QPlainTextEdit;
 class QPushButton;
+class QShowEvent;
 class QTableWidget;
 class RpcClient;
 class WorkerController;
@@ -38,6 +41,7 @@ public:
     void setLightTheme(bool isLight);
 
 protected:
+    void showEvent(QShowEvent* event) override;
     void closeEvent(QCloseEvent* event) override;
 
 private Q_SLOTS:
@@ -48,7 +52,7 @@ private Q_SLOTS:
     void onDeleteWorker(const QString& id);
     void onDiscoverFleet();
     void onStopUnregistered();
-    void onDisableAllDoubleMining();
+    void onToggleAllInternalGen();
     void onImportProfiles();
     void onExportProfiles();
     void onToggleTheme();
@@ -63,8 +67,14 @@ private:
     void rebuildTable();
     void applyFilters();
     void updateKpis();
+    void updateInternalGenButton();
     void updateInspector();
     void pollGpusAndPods();
+    int computeColumnFitWidth(int col) const;
+    void fitTableColumnToContents(int col, bool allowShrink);
+    void fitTableColumnsToContents(bool allowShrink);
+    void ensureInitialWindowFitsTable();
+    void restoreTableSelection(const QString& targetWorkerId, int preferredCol);
 
     ConfigStore* m_store{nullptr};
     RpcClient* m_rpc{nullptr};
@@ -74,6 +84,11 @@ private:
     bool m_isLight{false};
     bool m_reallyQuitting{false};
     bool m_trayNotifiedOnce{false};
+    bool m_initialColumnFitDone{false};
+    bool m_autoResizingColumns{false};
+    bool m_rebuildingTable{false};
+    QSet<int> m_userResizedColumns;
+    QString m_lastProfileSignature;
     int m_statusFilter{0}; // 0=All, 1=Running, 2=Stopped, 3=Warnings
     QString m_selectedWorkerId;
 
@@ -123,6 +138,7 @@ private:
     QLabel* m_kpiSubNet{nullptr};
 
     // Filter toolbar
+    QButtonGroup* m_statusFilterGroup{nullptr};
     QPushButton* m_pillAll{nullptr};
     QPushButton* m_pillRunning{nullptr};
     QPushButton* m_pillStopped{nullptr};

@@ -1,5 +1,6 @@
 #include "worker_dialog.h"
 
+#include "config_store.h"
 #include "i18n.h"
 #include "process_scanner.h"
 #include "rpc_client.h"
@@ -37,7 +38,7 @@ WorkerDialog::WorkerDialog(const WorkerProfile* existingProfile,
         m_original.engine = MinerEngine::CpuMiner;
         m_original.binaryPath = ProcessScanner::defaultCpuMinerPath();
         m_original.targetType = TargetType::LocalWallet;
-        m_original.confPath = QDir::homePath() + QStringLiteral("/.kristatech/kristatech.conf");
+        m_original.confPath = ConfigStore::defaultKristaTechConfPath();
         m_original.threads = 1;
         m_original.sshPort = 22;
         m_original.autoRestart = true;
@@ -101,7 +102,7 @@ WorkerDialog::WorkerDialog(const WorkerProfile* existingProfile,
     confLay->setContentsMargins(0, 0, 0, 0);
     confLay->setSpacing(6);
     m_editConfPath = new QLineEdit(
-        m_original.confPath.isEmpty() ? (QDir::homePath() + QStringLiteral("/.kristatech/kristatech.conf")) : m_original.confPath,
+        m_original.confPath.isEmpty() ? ConfigStore::defaultKristaTechConfPath() : m_original.confPath,
         m_rowConf);
     QPushButton* btnBrowseConf = new QPushButton(KTr(QStringLiteral("dlg.browse")), m_rowConf);
     connect(btnBrowseConf, &QPushButton::clicked, this, &WorkerDialog::onBrowseConf);

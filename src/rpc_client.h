@@ -28,6 +28,7 @@ public:
     void refreshPoolAddressesFromTarget(const WorkerProfile& profile);
 
     NodeMiningStatus statusForTarget(const QString& targetKey) const;
+    void setTargetStatus(const QString& targetKey, const NodeMiningStatus& status);
     PoolSeatInfo seatInfoForAddress(const QString& address) const;
     QHash<QString, PoolSeatInfo> allKnownSeats() const { return m_poolSeats; }
     QVector<QPair<QString, PoolSeatInfo>> localOwnedSeats() const { return m_localOwnedSeats; }

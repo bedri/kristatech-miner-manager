@@ -1,0 +1,15 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=KristaTech Miner Manager
+Name[tr]=KristaTech Madenci Yöneticisi
+GenericName=Miner Fleet Manager
+GenericName[tr]=Madenci Filo Yöneticisi
+Comment=Manage external cpuminer and ccminer workers on the KristaTech ADAM network
+Comment[tr]=KristaTech ADAM ağındaki harici cpuminer ve ccminer işçilerini yönetin
+Exec=kristatech-miner-manager
+Icon=kristatech-miner-manager
+Terminal=false
+Categories=Utility;Network;Qt;
+StartupNotify=true
+StartupWMClass=kristatech-miner-manager

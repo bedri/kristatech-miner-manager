@@ -7,13 +7,16 @@
 #include <QJsonDocument>
 #include <QProcess>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QStandardPaths>
 
+#ifndef Q_OS_WIN
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 ConfigStore::ConfigStore(const QString& baseDir)
     : m_baseDir(baseDir.isEmpty() ? defaultConfigDir() : baseDir)
@@ -80,6 +83,24 @@ bool ConfigStore::writeFile0600(const QString& path, const QByteArray& content, 
         return false;
     }
 
+#ifdef Q_OS_WIN
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (errorOut) *errorOut = file.errorString();
+        return false;
+    }
+    if (file.write(content) != content.size()) {
+        if (errorOut) *errorOut = file.errorString();
+        file.cancelWriting();
+        return false;
+    }
+    if (!file.commit()) {
+        if (errorOut) *errorOut = file.errorString();
+        return false;
+    }
+    QFile::setPermissions(path, QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    return true;
+#else
     const QString tmpPath = path + QStringLiteral(".tmp.%1").arg(static_cast<qint64>(::getpid()));
     const QByteArray tmpLocal = tmpPath.toLocal8Bit();
     int fd = ::open(tmpLocal.constData(), O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
@@ -112,6 +133,28 @@ bool ConfigStore::writeFile0600(const QString& path, const QByteArray& content, 
         return false;
     }
     return true;
+#endif
+}
+
+QString ConfigStore::defaultKristaTechConfPath()
+{
+#ifdef Q_OS_WIN
+    const QString appData = qEnvironmentVariable("APPDATA");
+    const QString roaming = appData.isEmpty()
+        ? (QDir::homePath() + QStringLiteral("/AppData/Roaming"))
+        : appData;
+    const QString winPath = QDir(roaming).filePath(QStringLiteral("KristaTech/kristatech.conf"));
+    if (QFileInfo::exists(winPath)) {
+        return winPath;
+    }
+    const QString dotPath = QDir::homePath() + QStringLiteral("/.kristatech/kristatech.conf");
+    if (QFileInfo::exists(dotPath)) {
+        return dotPath;
+    }
+    return winPath;
+#else
+    return QDir::homePath() + QStringLiteral("/.kristatech/kristatech.conf");
+#endif
 }
 
 QVector<WorkerProfile> ConfigStore::loadProfiles(QString* errorOut) const
@@ -234,7 +277,7 @@ RpcCredentials ConfigStore::resolveCredentials(const WorkerProfile& profile)
 {
     if (profile.targetType == TargetType::LocalWallet) {
         const QString path = profile.confPath.isEmpty()
-            ? (QDir::homePath() + QStringLiteral("/.kristatech/kristatech.conf"))
+            ? defaultKristaTechConfPath()
             : profile.confPath;
         QFile f(path);
         if (!f.open(QIODevice::ReadOnly)) {
@@ -251,8 +294,14 @@ RpcCredentials ConfigStore::resolveCredentials(const WorkerProfile& profile)
             bad.error = QStringLiteral("Podman container name is empty");
             return bad;
         }
+        const QString podmanBin = QStandardPaths::findExecutable(QStringLiteral("podman"));
+        if (podmanBin.isEmpty()) {
+            RpcCredentials bad;
+            bad.error = QStringLiteral("podman executable not found in PATH");
+            return bad;
+        }
         QProcess proc;
-        proc.start(QStringLiteral("podman"),
+        proc.start(podmanBin,
                    {QStringLiteral("exec"), profile.podmanName.trimmed(),
                     QStringLiteral("cat"), QStringLiteral("/data/kristatech.conf")});
         if (!proc.waitForFinished(5000) || proc.exitCode() != 0) {

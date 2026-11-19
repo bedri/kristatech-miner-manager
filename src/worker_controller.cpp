@@ -6,9 +6,17 @@
 #include <QFileInfo>
 #include <QProcess>
 #include <QRegularExpression>
+#include <QStandardPaths>
 #include <QTimer>
 
+#ifdef Q_OS_WIN
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
 #include <csignal>
+#endif
 
 namespace {
 
@@ -33,6 +41,80 @@ bool isValidCpuAffinity(const QString& affinity)
 {
     static const QRegularExpression re(QStringLiteral("^[0-9,-]+$"));
     return re.match(affinity.trimmed()).hasMatch();
+}
+
+#ifdef Q_OS_WIN
+DWORD_PTR parseCpuAffinityMask(const QString& spec)
+{
+    DWORD_PTR mask = 0;
+    const QStringList parts = spec.trimmed().split(QLatin1Char(','), Qt::SkipEmptyParts);
+    const int maxBits = static_cast<int>(sizeof(DWORD_PTR) * 8);
+    for (const QString& part : parts) {
+        const int dash = part.indexOf(QLatin1Char('-'));
+        if (dash >= 0) {
+            bool okA = false;
+            bool okB = false;
+            const int a = part.left(dash).toInt(&okA);
+            const int b = part.mid(dash + 1).toInt(&okB);
+            if (okA && okB && a >= 0 && b >= a) {
+                for (int cpu = a; cpu <= b && cpu < maxBits; ++cpu) {
+                    mask |= (DWORD_PTR(1) << cpu);
+                }
+            }
+        } else {
+            bool ok = false;
+            const int cpu = part.toInt(&ok);
+            if (ok && cpu >= 0 && cpu < maxBits) {
+                mask |= (DWORD_PTR(1) << cpu);
+            }
+        }
+    }
+    return mask;
+}
+
+void applyWindowsCpuAffinity(qint64 pid, const QString& affinitySpec)
+{
+    const DWORD_PTR mask = parseCpuAffinityMask(affinitySpec);
+    if (mask == 0 || pid <= 1) {
+        return;
+    }
+    HANDLE hProc = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
+                               FALSE, static_cast<DWORD>(pid));
+    if (hProc) {
+        SetProcessAffinityMask(hProc, mask);
+        CloseHandle(hProc);
+    }
+}
+#endif
+
+void terminateProcessByPid(qint64 pid, bool force)
+{
+    if (pid <= 1) {
+        return;
+    }
+#ifdef Q_OS_WIN
+    if (!force) {
+        const QString tk = QStandardPaths::findExecutable(QStringLiteral("taskkill"));
+        if (!tk.isEmpty()) {
+            QProcess proc;
+            proc.setProgram(tk);
+            proc.setArguments({QStringLiteral("/PID"), QString::number(pid), QStringLiteral("/T")});
+            proc.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
+                args->flags |= CREATE_NO_WINDOW;
+            });
+            if (proc.startDetached()) {
+                return;
+            }
+        }
+    }
+    HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, static_cast<DWORD>(pid));
+    if (hProc) {
+        TerminateProcess(hProc, 1);
+        CloseHandle(hProc);
+    }
+#else
+    ::kill(static_cast<pid_t>(pid), force ? SIGKILL : SIGTERM);
+#endif
 }
 
 } // namespace
@@ -261,9 +343,15 @@ void WorkerController::startWorker(const QString& id)
 void WorkerController::startLocalOrPodman(const WorkerProfile& p, WorkerRuntime& rt)
 {
     m_store->ensureDirectories();
-    const QString exePath = !p.binaryPath.trimmed().isEmpty()
+    QString exePath = !p.binaryPath.trimmed().isEmpty()
         ? p.binaryPath.trimmed()
         : (p.engine == MinerEngine::CcMiner ? ProcessScanner::defaultCcMinerPath() : ProcessScanner::defaultCpuMinerPath());
+    if (!QFileInfo::exists(exePath) && !exePath.contains(QLatin1Char('/')) && !exePath.contains(QLatin1Char('\\'))) {
+        const QString inPath = QStandardPaths::findExecutable(exePath);
+        if (!inPath.isEmpty()) {
+            exePath = inPath;
+        }
+    }
 
     if (!QFileInfo::exists(exePath) || !QFileInfo(exePath).isExecutable()) {
         rt.status = WorkerStatus::Error;
@@ -306,6 +394,16 @@ void WorkerController::startLocalOrPodman(const WorkerProfile& p, WorkerRuntime&
     QString program;
     QStringList fullArgs;
 
+#ifdef Q_OS_WIN
+    if (p.targetType == TargetType::PodmanContainer) {
+        rt.status = WorkerStatus::Error;
+        rt.lastError = QStringLiteral("Podman container targets are only supported on Linux hosts.");
+        appendSanitizedLines(p.id, rt, {QStringLiteral("[KMM] ERROR: ") + rt.lastError});
+        return;
+    }
+    program = minerCmdArgs.takeFirst();
+    fullArgs = minerCmdArgs;
+#else
     if (p.targetType == TargetType::PodmanContainer) {
         qint64 podPid = 0;
         const QVector<PodmanContainerInfo> pods = ProcessScanner::discoverPodmanContainers();
@@ -342,6 +440,7 @@ void WorkerController::startLocalOrPodman(const WorkerProfile& p, WorkerRuntime&
             fullArgs = minerCmdArgs;
         }
     }
+#endif
 
     QProcess starter;
     starter.setProgram(program);
@@ -349,6 +448,11 @@ void WorkerController::startLocalOrPodman(const WorkerProfile& p, WorkerRuntime&
     starter.setStandardInputFile(QProcess::nullDevice());
     starter.setStandardOutputFile(logPath, QIODevice::Append);
     starter.setStandardErrorFile(logPath, QIODevice::Append);
+#ifdef Q_OS_WIN
+    starter.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
+        args->flags |= CREATE_NO_WINDOW;
+    });
+#endif
 
     qint64 startedPid = 0;
     if (!starter.startDetached(&startedPid) || startedPid <= 0) {
@@ -357,6 +461,12 @@ void WorkerController::startLocalOrPodman(const WorkerProfile& p, WorkerRuntime&
         appendSanitizedLines(p.id, rt, {QStringLiteral("[KMM] ERROR: ") + rt.lastError});
         return;
     }
+
+#ifdef Q_OS_WIN
+    if (!p.cpuAffinity.trimmed().isEmpty() && isValidCpuAffinity(p.cpuAffinity)) {
+        applyWindowsCpuAffinity(startedPid, p.cpuAffinity);
+    }
+#endif
 
     if (p.targetType == TargetType::PodmanContainer) {
         rt.wrapperPid = startedPid;
@@ -582,19 +692,19 @@ void WorkerController::stopWorker(const QString& id)
     const qint64 minerPid = rt.pid;
     const qint64 wrapPid = rt.wrapperPid;
     if (minerPid > 1) {
-        ::kill(static_cast<pid_t>(minerPid), SIGTERM);
+        terminateProcessByPid(minerPid, /*force=*/false);
     }
     if (wrapPid > 1 && wrapPid != minerPid) {
-        ::kill(static_cast<pid_t>(wrapPid), SIGTERM);
+        terminateProcessByPid(wrapPid, /*force=*/false);
     }
 
     if (minerPid > 1 || wrapPid > 1) {
         QTimer::singleShot(2500, this, [minerPid, wrapPid]() {
             if (minerPid > 1 && ProcessScanner::isPidAlive(minerPid)) {
-                ::kill(static_cast<pid_t>(minerPid), SIGKILL);
+                terminateProcessByPid(minerPid, /*force=*/true);
             }
             if (wrapPid > 1 && wrapPid != minerPid && ProcessScanner::isPidAlive(wrapPid)) {
-                ::kill(static_cast<pid_t>(wrapPid), SIGKILL);
+                terminateProcessByPid(wrapPid, /*force=*/true);
             }
         });
     }
@@ -743,7 +853,7 @@ int WorkerController::adoptRunningProcesses(bool createProfilesForUnknown)
             np.binaryPath = dp.binaryPath;
             np.targetType = dp.targetType;
             if (dp.targetType == TargetType::LocalWallet) {
-                np.confPath = QDir::homePath() + QStringLiteral("/.kristatech/kristatech.conf");
+                np.confPath = ConfigStore::defaultKristaTechConfPath();
             } else if (dp.targetType == TargetType::PodmanContainer) {
                 np.podmanName = dp.podmanName;
             }
@@ -815,7 +925,7 @@ void WorkerController::autoDiscoverFleet(std::function<void(int added, int adopt
         }
     }
 
-    const QString localConf = QDir::homePath() + QStringLiteral("/.kristatech/kristatech.conf");
+    const QString localConf = ConfigStore::defaultKristaTechConfPath();
     if (!m_rpc) {
         const int added = m_profiles.size() - prevCount;
         if (added > 0) saveProfiles();
@@ -865,11 +975,16 @@ void WorkerController::stopAllManagedAndCleanup()
     for (const WorkerProfile& p : m_profiles) {
         if (p.targetType == TargetType::RemoteSsh) continue;
         WorkerRuntime& rt = m_runtimes[p.id];
+#ifdef Q_OS_WIN
+        const bool forceShutdown = true;
+#else
+        const bool forceShutdown = false;
+#endif
         if (rt.pid > 1) {
-            ::kill(static_cast<pid_t>(rt.pid), SIGTERM);
+            terminateProcessByPid(rt.pid, forceShutdown);
         }
         if (rt.wrapperPid > 1 && rt.wrapperPid != rt.pid) {
-            ::kill(static_cast<pid_t>(rt.wrapperPid), SIGTERM);
+            terminateProcessByPid(rt.wrapperPid, forceShutdown);
         }
         rt.status = WorkerStatus::Stopped;
         rt.pid = 0;

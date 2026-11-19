@@ -1,5 +1,16 @@
 <RCC>
     <qresource prefix="/">
         <file alias="logo.png">logo.png</file>
+        <file>icons/kristatech-miner-manager_16.png</file>
+        <file>icons/kristatech-miner-manager_24.png</file>
+        <file>icons/kristatech-miner-manager_32.png</file>
+        <file>icons/kristatech-miner-manager_48.png</file>
+        <file>icons/kristatech-miner-manager_64.png</file>
+        <file>icons/kristatech-miner-manager_128.png</file>
+        <file>icons/kristatech-miner-manager_256.png</file>
+        <file>icons/kristatech-miner-manager_512.png</file>
+        <file>icons/check_white.png</file>
+        <file>icons/chevron_down_light.png</file>
+        <file>icons/chevron_down_dark.png</file>
     </qresource>
 </RCC>

@@ -60,6 +60,7 @@ void I18n::initTable()
     add("btn.stop_all", "Stop All", "Tümünü Durdur");
     add("btn.stop_unreg", "Stop Unregistered", "Kayıtsızları Durdur");
     add("btn.disable_gen", "Disable Internal Gen", "Dahili Kazımı Kapat");
+    add("btn.enable_gen", "Enable Internal Gen", "Dahili Kazımı Aç");
     add("btn.import", "Import", "İçe Aktar");
     add("btn.export", "Export", "Dışa Aktar");
     add("btn.lang", "EN / TR", "TR / EN");
@@ -72,7 +73,7 @@ void I18n::initTable()
     add("kpi.hashrate", "TOTAL HASHRATE", "TOPLAM HASH HIZI");
     add("kpi.solutions", "SOLUTIONS (A / S / R)", "ÇÖZÜMLER (K / B / R)");
     add("kpi.gpu", "CUDA GPU TELEMETRY", "CUDA GPU TELEMETRİ");
-    add("kpi.network", "NETWORK & DOUBLE-MINING", "AĞ & ÇİFT MADENCİLİK");
+    add("kpi.network", "NETWORK & INTERNAL GEN", "AĞ & DAHİLİ KAZIM");
     add("kpi.no_gpu", "No NVIDIA GPU / nvidia-smi", "NVIDIA GPU yok / nvidia-smi bulunamadı");
     add("kpi.double_mine_warn", "Internal CPU Gen ON", "Dahili CPU Kazımı AÇIK");
     add("kpi.double_mine_clean", "Internal CPU Gen OFF", "Dahili CPU Kazımı KAPALI");
@@ -201,4 +202,6 @@ void I18n::initTable()
         "%2 dosyasından %1 işçi profili içe aktarıldı.");
     add("msg.gen_disabled", "Disabled internal CPU mining (setgenerate false) on %1.",
         "%1 üzerinde dahili CPU madenciliği kapatıldı (setgenerate false).");
+    add("msg.gen_enabled", "Enabled internal CPU mining (setgenerate true) on %1.",
+        "%1 üzerinde dahili CPU madenciliği açıldı (setgenerate true).");
 }

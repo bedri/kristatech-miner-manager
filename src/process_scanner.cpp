@@ -2,6 +2,7 @@
 
 #include "config_store.h"
 
+#include <QCoreApplication>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -13,12 +14,168 @@
 #include <QRegularExpression>
 #include <QStandardPaths>
 
+#ifdef Q_OS_WIN
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <tlhelp32.h>
+#else
 #include <cerrno>
 #include <csignal>
 #include <unistd.h>
+#endif
 
 namespace {
 
+QString normalizeExeNameLower(const QString& arg)
+{
+    QString s = arg;
+    s.replace(QLatin1Char('\\'), QLatin1Char('/'));
+    QString base = QFileInfo(s).fileName().toLower();
+    if (base.endsWith(QStringLiteral(".exe"))) {
+        base.chop(4);
+    }
+    return base;
+}
+
+bool isMinerExeBase(const QString& base)
+{
+    return base == QStringLiteral("cpuminer")
+        || base.startsWith(QStringLiteral("cpuminer-"))
+        || base == QStringLiteral("ccminer")
+        || base.startsWith(QStringLiteral("ccminer-"));
+}
+
+#ifdef Q_OS_WIN
+QStringList splitWindowsCommandLine(const QString& cmdLine)
+{
+    QStringList args;
+    QString current;
+    bool inQuotes = false;
+    bool hasToken = false;
+    for (int i = 0; i < cmdLine.size(); ++i) {
+        const QChar c = cmdLine.at(i);
+        if (c == QLatin1Char('"')) {
+            if (inQuotes && i + 1 < cmdLine.size() && cmdLine.at(i + 1) == QLatin1Char('"')) {
+                current.append(QLatin1Char('"'));
+                ++i;
+            } else {
+                inQuotes = !inQuotes;
+                hasToken = true;
+            }
+        } else if (!inQuotes && c.isSpace()) {
+            if (hasToken) {
+                args.append(current);
+                current.clear();
+                hasToken = false;
+            }
+        } else {
+            current.append(c);
+            hasToken = true;
+        }
+    }
+    if (hasToken) {
+        args.append(current);
+    }
+    return args;
+}
+
+struct WinProcHit {
+    qint64 pid{0};
+    qint64 ppid{0};
+    QString exeName;
+    QString exePath;
+};
+
+QVector<WinProcHit> enumerateWindowsMinerProcesses()
+{
+    QVector<WinProcHit> hits;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        return hits;
+    }
+    PROCESSENTRY32W pe;
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            const QString exeName = QString::fromWCharArray(pe.szExeFile);
+            if (!isMinerExeBase(normalizeExeNameLower(exeName))) {
+                continue;
+            }
+            WinProcHit hit;
+            hit.pid = static_cast<qint64>(pe.th32ProcessID);
+            hit.ppid = static_cast<qint64>(pe.th32ParentProcessID);
+            hit.exeName = exeName;
+
+            HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+            if (hProc) {
+                wchar_t buf[32768];
+                DWORD sz = static_cast<DWORD>(sizeof(buf) / sizeof(buf[0]));
+                if (QueryFullProcessImageNameW(hProc, 0, buf, &sz)) {
+                    hit.exePath = QString::fromWCharArray(buf, static_cast<int>(sz));
+                }
+                CloseHandle(hProc);
+            }
+            hits.append(hit);
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return hits;
+}
+
+QHash<qint64, QString> queryWindowsCommandLines(const QVector<qint64>& pids)
+{
+    QHash<qint64, QString> out;
+    if (pids.isEmpty()) {
+        return out;
+    }
+    QString psBin = QStandardPaths::findExecutable(QStringLiteral("powershell"));
+    if (psBin.isEmpty()) {
+        psBin = QStandardPaths::findExecutable(QStringLiteral("pwsh"));
+    }
+    if (psBin.isEmpty()) {
+        return out;
+    }
+
+    QStringList filterParts;
+    filterParts.reserve(pids.size());
+    for (qint64 pid : pids) {
+        filterParts.append(QStringLiteral("ProcessId=") + QString::number(pid));
+    }
+    const QString script = QStringLiteral(
+        "Get-CimInstance Win32_Process -Filter '%1' | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress")
+        .arg(filterParts.join(QStringLiteral(" OR ")));
+
+    QProcess proc;
+    proc.start(psBin, {QStringLiteral("-NoProfile"), QStringLiteral("-NonInteractive"), QStringLiteral("-Command"), script});
+    if (!proc.waitForFinished(3000) || proc.exitCode() != 0) {
+        return out;
+    }
+    const QByteArray raw = proc.readAllStandardOutput().trimmed();
+    if (raw.isEmpty()) {
+        return out;
+    }
+    const QJsonDocument doc = QJsonDocument::fromJson(raw);
+    auto collectObj = [&out](const QJsonObject& obj) {
+        const qint64 pid = obj.value(QStringLiteral("ProcessId")).toInteger();
+        const QString cmd = obj.value(QStringLiteral("CommandLine")).toString();
+        if (pid > 0 && !cmd.isEmpty()) {
+            out.insert(pid, cmd);
+        }
+    };
+    if (doc.isObject()) {
+        collectObj(doc.object());
+    } else if (doc.isArray()) {
+        for (const QJsonValue& v : doc.array()) {
+            if (v.isObject()) {
+                collectObj(v.toObject());
+            }
+        }
+    }
+    return out;
+}
+#else
 QStringList readProcCmdline(const QString& procPath)
 {
     QFile f(procPath + QStringLiteral("/cmdline"));
@@ -74,6 +231,7 @@ QString resolveProcStdoutPath(qint64 pid)
     }
     return target;
 }
+#endif
 
 void populateFromMinerConfigJson(const QString& cfgPath, DiscoveredProcess& out)
 {
@@ -123,22 +281,66 @@ ProcessScanner::~ProcessScanner()
 
 QString ProcessScanner::defaultCpuMinerPath()
 {
-    const QString preferred = QStringLiteral("/home/bedri/Coin-Projects/cpuminer-opt/cpuminer");
+#ifdef Q_OS_WIN
+    const QString appDir = QCoreApplication::applicationDirPath();
+    const QStringList candidates = {
+        appDir + QStringLiteral("/cpuminer.exe"),
+        QDir::homePath() + QStringLiteral("/Coin-Projects/cpuminer-opt/cpuminer.exe"),
+        QStringLiteral("C:/kristatech/cpuminer/cpuminer.exe")
+    };
+    for (const QString& c : candidates) {
+        if (QFileInfo::exists(c) && QFileInfo(c).isExecutable()) {
+            return QDir::toNativeSeparators(c);
+        }
+    }
+    const QString inPath = QStandardPaths::findExecutable(QStringLiteral("cpuminer"));
+    if (!inPath.isEmpty()) {
+        return QDir::toNativeSeparators(inPath);
+    }
+    const QString inPathAlt = QStandardPaths::findExecutable(QStringLiteral("cpuminer-opt"));
+    return inPathAlt.isEmpty() ? QStringLiteral("cpuminer.exe") : QDir::toNativeSeparators(inPathAlt);
+#else
+    const QString appDirCandidate = QCoreApplication::applicationDirPath() + QStringLiteral("/cpuminer");
+    if (QFileInfo::exists(appDirCandidate) && QFileInfo(appDirCandidate).isExecutable()) {
+        return appDirCandidate;
+    }
+    const QString preferred = QDir::homePath() + QStringLiteral("/Coin-Projects/cpuminer-opt/cpuminer");
     if (QFileInfo::exists(preferred) && QFileInfo(preferred).isExecutable()) {
         return preferred;
     }
     const QString inPath = QStandardPaths::findExecutable(QStringLiteral("cpuminer"));
     return inPath.isEmpty() ? preferred : inPath;
+#endif
 }
 
 QString ProcessScanner::defaultCcMinerPath()
 {
-    const QString preferred = QStringLiteral("/home/bedri/Coin-Projects/ccminer/ccminer");
+#ifdef Q_OS_WIN
+    const QString appDir = QCoreApplication::applicationDirPath();
+    const QStringList candidates = {
+        appDir + QStringLiteral("/ccminer.exe"),
+        QDir::homePath() + QStringLiteral("/Coin-Projects/ccminer/ccminer.exe"),
+        QStringLiteral("C:/kristatech/ccminer/ccminer.exe")
+    };
+    for (const QString& c : candidates) {
+        if (QFileInfo::exists(c) && QFileInfo(c).isExecutable()) {
+            return QDir::toNativeSeparators(c);
+        }
+    }
+    const QString inPath = QStandardPaths::findExecutable(QStringLiteral("ccminer"));
+    return inPath.isEmpty() ? QStringLiteral("ccminer.exe") : QDir::toNativeSeparators(inPath);
+#else
+    const QString appDirCandidate = QCoreApplication::applicationDirPath() + QStringLiteral("/ccminer");
+    if (QFileInfo::exists(appDirCandidate) && QFileInfo(appDirCandidate).isExecutable()) {
+        return appDirCandidate;
+    }
+    const QString preferred = QDir::homePath() + QStringLiteral("/Coin-Projects/ccminer/ccminer");
     if (QFileInfo::exists(preferred) && QFileInfo(preferred).isExecutable()) {
         return preferred;
     }
     const QString inPath = QStandardPaths::findExecutable(QStringLiteral("ccminer"));
     return inPath.isEmpty() ? preferred : inPath;
+#endif
 }
 
 bool ProcessScanner::parseCmdline(const QStringList& args, DiscoveredProcess& out)
@@ -149,7 +351,7 @@ bool ProcessScanner::parseCmdline(const QStringList& args, DiscoveredProcess& ou
 
     int minerArgIdx = -1;
     for (int i = 0; i < args.size(); ++i) {
-        const QString base = QFileInfo(args[i]).fileName().toLower();
+        const QString base = normalizeExeNameLower(args[i]);
         if (base == QStringLiteral("cpuminer") || base.startsWith(QStringLiteral("cpuminer-"))) {
             out.engine = MinerEngine::CpuMiner;
             out.binaryPath = args[i];
@@ -236,8 +438,13 @@ QVector<PodmanContainerInfo> ProcessScanner::discoverPodmanContainers()
         }
     }
 
+    const QString podmanBin = QStandardPaths::findExecutable(QStringLiteral("podman"));
+    if (podmanBin.isEmpty()) {
+        return result;
+    }
+
     QProcess ps;
-    ps.start(QStringLiteral("podman"),
+    ps.start(podmanBin,
              {QStringLiteral("ps"), QStringLiteral("-a"),
               QStringLiteral("--filter"), QStringLiteral("name=krista-cold-"),
               QStringLiteral("--format"), QStringLiteral("json")});
@@ -289,6 +496,38 @@ QVector<DiscoveredProcess> ProcessScanner::scanRunningMiners()
 {
     QVector<DiscoveredProcess> out;
 
+#ifdef Q_OS_WIN
+    const QVector<WinProcHit> hits = enumerateWindowsMinerProcesses();
+    if (hits.isEmpty()) {
+        return out;
+    }
+    QVector<qint64> pids;
+    pids.reserve(hits.size());
+    for (const WinProcHit& h : hits) {
+        pids.append(h.pid);
+    }
+    const QHash<qint64, QString> cmdLines = queryWindowsCommandLines(pids);
+    for (const WinProcHit& h : hits) {
+        QStringList args;
+        const QString cmd = cmdLines.value(h.pid);
+        if (!cmd.isEmpty()) {
+            args = splitWindowsCommandLine(cmd);
+        }
+        if (args.isEmpty()) {
+            args.append(h.exePath.isEmpty() ? h.exeName : h.exePath);
+        }
+        DiscoveredProcess dp;
+        if (!parseCmdline(args, dp)) {
+            continue;
+        }
+        dp.pid = h.pid;
+        if (dp.binaryPath.isEmpty() && !h.exePath.isEmpty()) {
+            dp.binaryPath = h.exePath;
+        }
+        out.append(dp);
+    }
+    return out;
+#else
     // 1. Map container PID -> container name
     QHash<qint64, QString> containerPidToName;
     const QVector<PodmanContainerInfo> pods = discoverPodmanContainers();
@@ -348,10 +587,9 @@ QVector<DiscoveredProcess> ProcessScanner::scanRunningMiners()
 
     for (qint64 pid : pids) {
         const RawProc& rp = rawProcs[pid];
-        const QString base0 = QFileInfo(rp.args.first()).fileName().toLower();
+        const QString base0 = normalizeExeNameLower(rp.args.first());
         // Skip wrapper parent process itself (podman unshare / taskset)
-        if (base0 != QStringLiteral("cpuminer") && base0 != QStringLiteral("ccminer") &&
-            !base0.startsWith(QStringLiteral("cpuminer-")) && !base0.startsWith(QStringLiteral("ccminer-"))) {
+        if (!isMinerExeBase(base0)) {
             continue;
         }
 
@@ -404,6 +642,7 @@ QVector<DiscoveredProcess> ProcessScanner::scanRunningMiners()
     }
 
     return out;
+#endif
 }
 
 bool ProcessScanner::isPidAlive(qint64 pid)
@@ -411,10 +650,21 @@ bool ProcessScanner::isPidAlive(qint64 pid)
     if (pid <= 1) {
         return false;
     }
+#ifdef Q_OS_WIN
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
+    if (!hProc) {
+        return GetLastError() == ERROR_ACCESS_DENIED;
+    }
+    DWORD exitCode = 0;
+    const bool ok = GetExitCodeProcess(hProc, &exitCode);
+    CloseHandle(hProc);
+    return ok && exitCode == STILL_ACTIVE;
+#else
     if (::kill(static_cast<pid_t>(pid), 0) == 0) {
         return true;
     }
     return errno == EPERM;
+#endif
 }
 
 qint64 ProcessScanner::findChildMinerPid(qint64 parentPid)
@@ -422,6 +672,15 @@ qint64 ProcessScanner::findChildMinerPid(qint64 parentPid)
     if (parentPid <= 1) {
         return 0;
     }
+#ifdef Q_OS_WIN
+    const QVector<WinProcHit> hits = enumerateWindowsMinerProcesses();
+    for (const WinProcHit& h : hits) {
+        if (h.ppid == parentPid) {
+            return h.pid;
+        }
+    }
+    return 0;
+#else
     const QDir procDir(QStringLiteral("/proc"));
     const QStringList entries = procDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
     for (const QString& entry : entries) {
@@ -432,12 +691,12 @@ qint64 ProcessScanner::findChildMinerPid(qint64 parentPid)
         if (readProcParentPid(pdir) != parentPid) continue;
         const QStringList args = readProcCmdline(pdir);
         if (args.isEmpty()) continue;
-        const QString base0 = QFileInfo(args.first()).fileName().toLower();
-        if (base0.startsWith(QStringLiteral("cpuminer")) || base0.startsWith(QStringLiteral("ccminer"))) {
+        if (isMinerExeBase(normalizeExeNameLower(args.first()))) {
             return pid;
         }
     }
     return 0;
+#endif
 }
 
 void ProcessScanner::queryNvidiaGpusAsync(std::function<void(const QVector<GpuTelemetry>& gpus)> cb)

@@ -8,32 +8,43 @@
 #include "worker_controller.h"
 #include "worker_dialog.h"
 
+#include <QAbstractButton>
 #include <QAction>
 #include <QApplication>
+#include <QButtonGroup>
 #include <QCheckBox>
 #include <QClipboard>
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QFileDialog>
+#include <QFontMetrics>
 #include <QFrame>
+#include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QIcon>
+#include <QItemSelectionModel>
 #include <QLabel>
+#include <QLayout>
 #include <QLineEdit>
 #include <QMenu>
 #include <QMessageBox>
 #include <QPixmap>
 #include <QPlainTextEdit>
+#include <QPointer>
 #include <QPushButton>
+#include <QScopedValueRollback>
+#include <QScreen>
 #include <QScrollBar>
 #include <QSettings>
 #include <QShortcut>
-#include <QSignalBlocker>
+#include <QShowEvent>
 #include <QSplitter>
 #include <QStyle>
 #include <QTableWidget>
 #include <QVBoxLayout>
+
+#include <memory>
 
 namespace {
 
@@ -98,7 +109,7 @@ MainWindow::MainWindow(ConfigStore* store,
 void MainWindow::setupUi()
 {
     resize(1380, 860);
-    setWindowIcon(QIcon(QStringLiteral(":/logo.png")));
+    setWindowIcon(Theme::appIcon());
 
     QWidget* central = new QWidget(this);
     setCentralWidget(central);
@@ -114,10 +125,11 @@ void MainWindow::setupUi()
     hdrLay->setSpacing(10);
 
     QLabel* logoLbl = new QLabel(headerCard);
-    const QPixmap logoPm(QStringLiteral(":/logo.png"));
+    const QPixmap logoPm = Theme::appIcon().pixmap(QSize(38, 38), qMax(qreal(1.0), devicePixelRatioF()));
     if (!logoPm.isNull()) {
-        logoLbl->setPixmap(logoPm.scaled(36, 36, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+        logoLbl->setPixmap(logoPm);
     }
+    logoLbl->setFixedSize(38, 38);
     hdrLay->addWidget(logoLbl);
 
     QVBoxLayout* titleBox = new QVBoxLayout();
@@ -190,16 +202,17 @@ void MainWindow::setupUi()
     tbLay->setContentsMargins(12, 8, 12, 8);
     tbLay->setSpacing(8);
 
+    m_statusFilterGroup = new QButtonGroup(this);
+    m_statusFilterGroup->setExclusive(true);
+
     auto makePill = [&](int filterIdx) {
         QPushButton* b = new QPushButton(toolbar);
         b->setProperty("variant", QStringLiteral("pill"));
-        b->setProperty("active", filterIdx == 0);
+        b->setCheckable(true);
+        b->setChecked(filterIdx == 0);
         b->setCursor(Qt::PointingHandCursor);
         b->setFocusPolicy(Qt::NoFocus);
-        connect(b, &QPushButton::clicked, this, [this, filterIdx]() {
-            m_statusFilter = filterIdx;
-            onFilterChanged();
-        });
+        m_statusFilterGroup->addButton(b, filterIdx);
         tbLay->addWidget(b);
         return b;
     };
@@ -207,6 +220,11 @@ void MainWindow::setupUi()
     m_pillRunning = makePill(1);
     m_pillStopped = makePill(2);
     m_pillWarnings = makePill(3);
+
+    connect(m_statusFilterGroup, &QButtonGroup::idClicked, this, [this](int filterIdx) {
+        m_statusFilter = filterIdx;
+        onFilterChanged();
+    });
 
     tbLay->addSpacing(8);
     m_comboEngineFilter = new QComboBox(toolbar);
@@ -241,25 +259,13 @@ void MainWindow::setupUi()
     m_table->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_table->setSelectionMode(QAbstractItemView::SingleSelection);
     m_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_table->setWordWrap(false);
+    m_table->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
     m_table->verticalHeader()->setVisible(false);
     m_table->setSortingEnabled(true);
     m_table->horizontalHeader()->setSortIndicator(-1, Qt::AscendingOrder);
     m_table->horizontalHeader()->setStretchLastSection(false);
-    m_table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Interactive);
-    m_table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Interactive);
-    m_table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Interactive);
-    m_table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
-    m_table->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Interactive);
-    m_table->horizontalHeader()->setSectionResizeMode(5, QHeaderView::Interactive);
-    m_table->horizontalHeader()->setSectionResizeMode(6, QHeaderView::Interactive);
-    m_table->horizontalHeader()->setSectionResizeMode(7, QHeaderView::Fixed);
-    m_table->setColumnWidth(0, 175);
-    m_table->setColumnWidth(1, 130);
-    m_table->setColumnWidth(2, 145);
-    m_table->setColumnWidth(4, 175);
-    m_table->setColumnWidth(5, 165);
-    m_table->setColumnWidth(6, 155);
-    m_table->setColumnWidth(7, 235);
+    m_table->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
     splitter->addWidget(m_table);
 
     // Bottom Inspector Card
@@ -320,7 +326,7 @@ void MainWindow::setupUi()
     connect(m_btnStartAll, &QPushButton::clicked, this, [this]() { m_controller->startAll(); });
     connect(m_btnStopAll, &QPushButton::clicked, this, [this]() { m_controller->stopAll(false); });
     connect(m_btnStopUnreg, &QPushButton::clicked, this, &MainWindow::onStopUnregistered);
-    connect(m_btnDisableGen, &QPushButton::clicked, this, &MainWindow::onDisableAllDoubleMining);
+    connect(m_btnDisableGen, &QPushButton::clicked, this, &MainWindow::onToggleAllInternalGen);
     connect(m_btnImport, &QPushButton::clicked, this, &MainWindow::onImportProfiles);
     connect(m_btnExport, &QPushButton::clicked, this, &MainWindow::onExportProfiles);
     connect(m_btnLang, &QPushButton::clicked, this, []() { I18n::instance().toggleLanguage(); });
@@ -329,7 +335,21 @@ void MainWindow::setupUi()
     connect(m_comboEngineFilter, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::onFilterChanged);
     connect(m_comboTargetFilter, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::onFilterChanged);
     connect(m_editSearch, &QLineEdit::textChanged, this, &MainWindow::onFilterChanged);
-    connect(m_table->horizontalHeader(), &QHeaderView::sortIndicatorChanged, this, [this]() { applyFilters(); });
+    connect(m_table->horizontalHeader(), &QHeaderView::sortIndicatorChanged, this, [this]() {
+        applyFilters();
+        restoreTableSelection(m_selectedWorkerId, m_table->currentColumn());
+    }, Qt::QueuedConnection);
+    connect(m_table->horizontalHeader(), &QHeaderView::sectionResized, this,
+            [this](int logicalIndex, int oldSize, int newSize) {
+                if (!m_autoResizingColumns && m_initialColumnFitDone && m_table->isVisible() && oldSize != newSize) {
+                    m_userResizedColumns.insert(logicalIndex);
+                }
+            });
+    connect(m_table->horizontalHeader(), &QHeaderView::sectionHandleDoubleClicked, this,
+            [this](int logicalIndex) {
+                m_userResizedColumns.remove(logicalIndex);
+                fitTableColumnToContents(logicalIndex, /*allowShrink=*/true);
+            });
     connect(m_table, &QTableWidget::itemSelectionChanged, this, &MainWindow::onRowSelectionChanged);
     connect(m_table, &QTableWidget::cellDoubleClicked, this, [this](int row, int) {
         if (QTableWidgetItem* it = m_table->item(row, 0)) {
@@ -369,7 +389,7 @@ void MainWindow::setupTray()
     if (!QSystemTrayIcon::isSystemTrayAvailable()) {
         return;
     }
-    m_tray = new QSystemTrayIcon(QIcon(QStringLiteral(":/logo.png")), this);
+    m_tray = new QSystemTrayIcon(Theme::appIcon(), this);
     QMenu* menu = new QMenu(this);
     m_actTrayShow = menu->addAction(QString(), this, [this]() {
         showNormal();
@@ -406,7 +426,7 @@ void MainWindow::retranslateUi()
     m_btnStartAll->setText(KTr(QStringLiteral("btn.start_all")));
     m_btnStopAll->setText(KTr(QStringLiteral("btn.stop_all")));
     m_btnStopUnreg->setText(KTr(QStringLiteral("btn.stop_unreg")));
-    m_btnDisableGen->setText(KTr(QStringLiteral("btn.disable_gen")));
+    updateInternalGenButton();
     m_btnImport->setText(KTr(QStringLiteral("btn.import")));
     m_btnExport->setText(KTr(QStringLiteral("btn.export")));
     m_btnLang->setText(KTr(QStringLiteral("btn.lang")));
@@ -432,16 +452,19 @@ void MainWindow::retranslateUi()
     m_comboTargetFilter->setItemText(4, KTr(QStringLiteral("target.ssh")));
     m_editSearch->setPlaceholderText(KTr(QStringLiteral("filter.search_ph")));
 
-    m_table->setHorizontalHeaderLabels({
-        KTr(QStringLiteral("col.worker")),
-        KTr(QStringLiteral("col.engine")),
-        KTr(QStringLiteral("col.target")),
-        KTr(QStringLiteral("col.address")),
-        KTr(QStringLiteral("col.pool")),
-        KTr(QStringLiteral("col.state")),
-        KTr(QStringLiteral("col.perf")),
-        KTr(QStringLiteral("col.actions"))
-    });
+    {
+        QScopedValueRollback<bool> guard(m_autoResizingColumns, true);
+        m_table->setHorizontalHeaderLabels({
+            KTr(QStringLiteral("col.worker")),
+            KTr(QStringLiteral("col.engine")),
+            KTr(QStringLiteral("col.target")),
+            KTr(QStringLiteral("col.address")),
+            KTr(QStringLiteral("col.pool")),
+            KTr(QStringLiteral("col.state")),
+            KTr(QStringLiteral("col.perf")),
+            KTr(QStringLiteral("col.actions"))
+        });
+    }
 
     m_lblInspectorHeader->setText(KTr(QStringLiteral("log.header")));
     m_btnCopyAddr->setText(KTr(QStringLiteral("log.copy_addr")));
@@ -458,6 +481,7 @@ void MainWindow::retranslateUi()
     }
 
     refreshTableAndKpis();
+    fitTableColumnsToContents(/*allowShrink=*/true);
 }
 
 void MainWindow::setLightTheme(bool isLight)
@@ -465,9 +489,132 @@ void MainWindow::setLightTheme(bool isLight)
     m_isLight = isLight;
     QSettings settings(QStringLiteral("KristaTech"), QStringLiteral("MinerManager"));
     settings.setValue(QStringLiteral("ui/lightTheme"), m_isLight);
-    qApp->setStyleSheet(Theme::buildStylesheet(m_isLight));
+    {
+        QScopedValueRollback<bool> guard(m_autoResizingColumns, true);
+        qApp->setStyleSheet(Theme::buildStylesheet(m_isLight));
+    }
     m_btnTheme->setText(KTr(m_isLight ? QStringLiteral("btn.theme_light") : QStringLiteral("btn.theme_dark")));
     refreshTableAndKpis();
+    fitTableColumnsToContents(/*allowShrink=*/true);
+}
+
+void MainWindow::showEvent(QShowEvent* event)
+{
+    QMainWindow::showEvent(event);
+    if (!m_initialColumnFitDone) {
+        m_initialColumnFitDone = true;
+        fitTableColumnsToContents(/*allowShrink=*/true);
+        ensureInitialWindowFitsTable();
+    }
+}
+
+void MainWindow::ensureInitialWindowFitsTable()
+{
+    if (!m_table) return;
+    int totalColsWidth = 0;
+    for (int c = 0; c < m_table->columnCount(); ++c) {
+        totalColsWidth += m_table->columnWidth(c);
+    }
+    const int chromeW = (m_table->verticalScrollBar() ? m_table->verticalScrollBar()->sizeHint().width() : 16)
+                      + m_table->frameWidth() * 2 + 36;
+    const int neededW = totalColsWidth + chromeW;
+    if (neededW <= width()) return;
+
+    QScreen* scr = screen();
+    if (!scr) scr = QGuiApplication::primaryScreen();
+    if (!scr) return;
+    const int maxAllowedW = scr->availableGeometry().width() - 48;
+    if (maxAllowedW > width()) {
+        resize(qMin(neededW, maxAllowedW), height());
+    }
+}
+
+int MainWindow::computeColumnFitWidth(int col) const
+{
+    if (!m_table || col < 0 || col >= m_table->columnCount()) {
+        return 0;
+    }
+
+    m_table->ensurePolished();
+    QHeaderView* hdr = m_table->horizontalHeader();
+    hdr->ensurePolished();
+
+    const int markReserve = m_table->isSortingEnabled()
+        ? qMax(14, m_table->style()->pixelMetric(QStyle::PM_HeaderMarkSize, nullptr, hdr)
+                   + m_table->style()->pixelMetric(QStyle::PM_HeaderMargin, nullptr, hdr))
+        : 0;
+
+    int width = hdr->sectionSizeHint(col);
+    if (m_table->isSortingEnabled() && hdr->sortIndicatorSection() != col) {
+        width += markReserve;
+    }
+
+    if (const QTableWidgetItem* hItem = m_table->horizontalHeaderItem(col)) {
+        const QString hText = hItem->text();
+        if (!hText.isEmpty()) {
+            QFont hf = hdr->font();
+            hf.setBold(true);
+            const QFontMetrics hfm(hf);
+            const int hTextW = qMax(hfm.horizontalAdvance(hText), hfm.boundingRect(hText).width());
+            width = qMax(width, hTextW + 19 + markReserve);
+        }
+    }
+
+    const int focusMargin = qMax(2, m_table->style()->pixelMetric(QStyle::PM_FocusFrameHMargin, nullptr, m_table));
+    const int cellHorizExtra = 16 + 2 * (focusMargin + 1) + 4;
+    const QFontMetrics defaultFm(m_table->font());
+
+    for (int r = 0; r < m_table->rowCount(); ++r) {
+        if (QWidget* cw = m_table->cellWidget(r, col)) {
+            cw->ensurePolished();
+            const auto children = cw->findChildren<QWidget*>();
+            for (QWidget* child : children) {
+                child->ensurePolished();
+                child->updateGeometry();
+            }
+            if (QLayout* lay = cw->layout()) {
+                lay->invalidate();
+                lay->activate();
+            }
+            width = qMax(width, qMax(cw->sizeHint().width(), cw->minimumSizeHint().width()) + 22);
+        }
+
+        if (const QTableWidgetItem* item = m_table->item(r, col)) {
+            const QString text = item->text();
+            if (!text.isEmpty()) {
+                const QFontMetrics fm = item->data(Qt::FontRole).isValid()
+                    ? QFontMetrics(item->font())
+                    : defaultFm;
+                const int textW = qMax(fm.horizontalAdvance(text), fm.boundingRect(text).width());
+                width = qMax(width, textW + cellHorizExtra);
+            }
+        }
+    }
+
+    return qMax(width, hdr->minimumSectionSize());
+}
+
+void MainWindow::fitTableColumnToContents(int col, bool allowShrink)
+{
+    if (!m_table || col < 0 || col >= m_table->columnCount() || m_userResizedColumns.contains(col)) {
+        return;
+    }
+    const int targetWidth = computeColumnFitWidth(col);
+    const int currentWidth = m_table->columnWidth(col);
+    if (allowShrink ? (targetWidth != currentWidth) : (targetWidth > currentWidth)) {
+        QScopedValueRollback<bool> guard(m_autoResizingColumns, true);
+        m_table->setColumnWidth(col, targetWidth);
+    }
+}
+
+void MainWindow::fitTableColumnsToContents(bool allowShrink)
+{
+    if (!m_table) {
+        return;
+    }
+    for (int c = 0; c < m_table->columnCount(); ++c) {
+        fitTableColumnToContents(c, allowShrink);
+    }
 }
 
 void MainWindow::onToggleTheme()
@@ -494,17 +641,56 @@ void MainWindow::refreshTableAndKpis()
 void MainWindow::rebuildTable()
 {
     if (!m_table) return;
+    QScopedValueRollback<bool> rebuildGuard(m_rebuildingTable, true);
+    QScopedValueRollback<bool> resizeGuard(m_autoResizingColumns, true);
     const ThemeColors tc = Theme::colors(m_isLight);
     const QVector<WorkerProfile>& profiles = m_controller->profiles();
 
-    const int savedScroll = m_table->verticalScrollBar() ? m_table->verticalScrollBar()->value() : 0;
+    QString profileSignature;
+    profileSignature.reserve(profiles.size() * 128);
+    for (const WorkerProfile& p : profiles) {
+        profileSignature.append(p.id).append(QLatin1Char('\x1f'))
+            .append(p.name).append(QLatin1Char('\x1f'))
+            .append(QString::number(static_cast<int>(p.engine))).append(QLatin1Char('\x1f'))
+            .append(QString::number(p.threads)).append(QLatin1Char('\x1f'))
+            .append(p.cpuAffinity).append(QLatin1Char('\x1f'))
+            .append(p.gpuDevices).append(QLatin1Char('\x1f'))
+            .append(QString::number(p.gpuIntensity, 'f', 1)).append(QLatin1Char('\x1f'))
+            .append(QString::number(static_cast<int>(p.targetType))).append(QLatin1Char('\x1f'))
+            .append(p.podmanName).append(QLatin1Char('\x1f'))
+            .append(p.rpcUrl).append(QLatin1Char('\x1f'))
+            .append(p.sshTarget).append(QLatin1Char('\x1f'))
+            .append(p.coinbaseAddress).append(QLatin1Char('\x1e'));
+    }
+    const bool structureChanged = (profileSignature != m_lastProfileSignature);
+    m_lastProfileSignature = profileSignature;
+
+    const int savedVScroll = m_table->verticalScrollBar() ? m_table->verticalScrollBar()->value() : 0;
+    const int savedHScroll = m_table->horizontalScrollBar() ? m_table->horizontalScrollBar()->value() : 0;
+    const int prevCol = qBound(0, m_table->currentColumn(), qMax(0, m_table->columnCount() - 2));
     const QString prevSelected = m_selectedWorkerId;
 
-    QSignalBlocker blocker(m_table->selectionModel());
+    m_table->setUpdatesEnabled(false);
+    m_table->clearSelection();
+    if (m_table->selectionModel()) {
+        m_table->selectionModel()->clearCurrentIndex();
+    }
     m_table->setSortingEnabled(false);
     m_table->setRowCount(profiles.size());
 
-    int rowToSelect = -1;
+    QFont btnFont = m_table->font();
+    btnFont.setPixelSize(12);
+    btnFont.setWeight(QFont::DemiBold);
+    const QFontMetrics btnFm(btnFont);
+    const QString startTxt = KTr(QStringLiteral("act.start"));
+    const QString stopTxt = KTr(QStringLiteral("act.stop"));
+    const QString editTxt = KTr(QStringLiteral("act.edit"));
+    const int startW = qMax(btnFm.horizontalAdvance(startTxt), btnFm.boundingRect(startTxt).width());
+    const int stopW = qMax(btnFm.horizontalAdvance(stopTxt), btnFm.boundingRect(stopTxt).width());
+    const int editW = qMax(btnFm.horizontalAdvance(editTxt), btnFm.boundingRect(editTxt).width());
+    const int toggleBtnW = qMax(startW, stopW) + 28; // 20px QSS padding + 2px border + 6px cushion
+    const int editBtnW = editW + 28;
+
     for (int r = 0; r < profiles.size(); ++r) {
         const WorkerProfile& p = profiles[r];
         const WorkerRuntime rt = m_controller->runtimeById(p.id);
@@ -513,8 +699,12 @@ void MainWindow::rebuildTable()
 
         const bool isRunning = (rt.pid > 0 && rt.status != WorkerStatus::Stopped && rt.status != WorkerStatus::Error) ||
                                rt.status == WorkerStatus::Restarting || rt.status == WorkerStatus::Starting;
-        const bool hasWarn = (seat.known && !seat.registered) || rt.warningDeferred || rt.warningRpcError ||
-                             (isRunning && nodeSt.checked && nodeSt.reachable && nodeSt.internalGenerate);
+        const bool unregWarn = !p.coinbaseAddress.isEmpty() && seat.known && !seat.registered;
+        const bool rpcOfflineWarn = nodeSt.checked && !nodeSt.reachable;
+        const bool missingAddrWarn = p.coinbaseAddress.isEmpty();
+        const bool statusErrWarn = (rt.status == WorkerStatus::Error);
+        const bool hasWarn = unregWarn || rt.warningDeferred || rt.warningRpcError ||
+                             rpcOfflineWarn || missingAddrWarn || statusErrWarn;
 
         // Col 0: Worker Name + Search blob + filter user data
         QTableWidgetItem* itName = new NumericSortItem(p.name);
@@ -527,7 +717,6 @@ void MainWindow::rebuildTable()
             .arg(p.name, p.id, p.coinbaseAddress, p.podmanName, p.sshTarget, p.rpcUrl);
         itName->setData(Qt::UserRole + 5, searchBlob);
         m_table->setItem(r, 0, itName);
-        if (p.id == prevSelected) rowToSelect = r;
 
         // Col 1: Engine & HW
         QString hwStr;
@@ -572,6 +761,9 @@ void MainWindow::rebuildTable()
         } else if (rt.warningDeferred) {
             poolText = QStringLiteral("⚠ ") + KTr(QStringLiteral("pool.deferred"));
             poolColor = QColor(tc.warnFg);
+        } else if (!seat.known && rpcOfflineWarn) {
+            poolText = QStringLiteral("⚠ ") + KTr(QStringLiteral("pool.rpc_offline"));
+            poolColor = QColor(tc.dangerFg);
         } else if (!seat.known) {
             poolText = KTr(QStringLiteral("pool.checking"));
         } else if (seat.registered) {
@@ -579,10 +771,6 @@ void MainWindow::rebuildTable()
                 .arg(seat.track)
                 .arg(seat.remainingBlocks);
             poolColor = QColor(tc.successFg);
-            if (isRunning && nodeSt.reachable && nodeSt.internalGenerate) {
-                poolText += QStringLiteral(" • 2xGen");
-                poolColor = QColor(tc.warnFg);
-            }
         } else {
             poolText = QStringLiteral("⚠ ") + KTr(QStringLiteral("pool.unregistered"));
             poolColor = QColor(tc.dangerFg);
@@ -622,15 +810,22 @@ void MainWindow::rebuildTable()
         m_table->setItem(r, 6, itPerf);
 
         // Col 7: Compact row actions
-        QWidget* actBox = new QWidget(m_table);
+        if (QWidget* oldAct = m_table->cellWidget(r, 7)) {
+            oldAct->hide();
+            m_table->removeCellWidget(r, 7);
+        }
+        QWidget* actBox = new QWidget(m_table->viewport());
+        actBox->setObjectName(QStringLiteral("rowActionCell"));
+        actBox->setAutoFillBackground(false);
         QHBoxLayout* actLay = new QHBoxLayout(actBox);
-        actLay->setContentsMargins(4, 2, 4, 2);
+        actLay->setContentsMargins(2, 0, 2, 0);
         actLay->setSpacing(4);
 
         const QString id = p.id;
-        QPushButton* bToggle = new QPushButton(isRunning ? KTr(QStringLiteral("act.stop")) : KTr(QStringLiteral("act.start")), actBox);
+        QPushButton* bToggle = new QPushButton(isRunning ? stopTxt : startTxt, actBox);
         bToggle->setProperty("variant", isRunning ? QStringLiteral("danger") : QStringLiteral("primary"));
-        bToggle->setFixedHeight(26);
+        bToggle->setProperty("compact", QStringLiteral("true"));
+        bToggle->setFixedSize(toggleBtnW, 26);
         bToggle->setFocusPolicy(Qt::NoFocus);
         connect(bToggle, &QPushButton::clicked, this, [this, id, isRunning]() {
             if (isRunning) m_controller->stopWorker(id);
@@ -639,17 +834,21 @@ void MainWindow::rebuildTable()
 
         QPushButton* bRestart = new QPushButton(QStringLiteral("↻"), actBox);
         bRestart->setToolTip(KTr(QStringLiteral("act.restart")));
+        bRestart->setProperty("compact", QStringLiteral("icon"));
         bRestart->setFixedSize(28, 26);
         bRestart->setFocusPolicy(Qt::NoFocus);
         connect(bRestart, &QPushButton::clicked, this, [this, id]() { m_controller->restartWorker(id); });
 
-        QPushButton* bEdit = new QPushButton(KTr(QStringLiteral("act.edit")), actBox);
-        bEdit->setFixedHeight(26);
+        QPushButton* bEdit = new QPushButton(editTxt, actBox);
+        bEdit->setProperty("compact", QStringLiteral("true"));
+        bEdit->setFixedSize(editBtnW, 26);
         bEdit->setFocusPolicy(Qt::NoFocus);
         connect(bEdit, &QPushButton::clicked, this, [this, id]() { onEditWorker(id); });
 
         QPushButton* bDel = new QPushButton(QStringLiteral("✕"), actBox);
         bDel->setToolTip(KTr(QStringLiteral("act.delete")));
+        bDel->setProperty("compact", QStringLiteral("icon"));
+        bDel->setProperty("role", QStringLiteral("deleteIcon"));
         bDel->setFixedSize(28, 26);
         bDel->setFocusPolicy(Qt::NoFocus);
         connect(bDel, &QPushButton::clicked, this, [this, id]() { onDeleteWorker(id); });
@@ -659,22 +858,73 @@ void MainWindow::rebuildTable()
         actLay->addWidget(bEdit);
         actLay->addWidget(bDel);
         m_table->setCellWidget(r, 7, actBox);
-        m_table->setRowHeight(r, 34);
+        m_table->setRowHeight(r, 36);
     }
 
     m_table->setSortingEnabled(true);
     applyFilters();
 
-    if (rowToSelect >= 0) {
-        m_table->selectRow(rowToSelect);
-    } else if (m_selectedWorkerId.isEmpty() && m_table->rowCount() > 0) {
-        m_table->selectRow(0);
-        if (QTableWidgetItem* it = m_table->item(0, 0)) {
-            m_selectedWorkerId = it->data(Qt::UserRole).toString();
+    restoreTableSelection(prevSelected, prevCol);
+    if (m_table->verticalScrollBar()) {
+        m_table->verticalScrollBar()->setValue(savedVScroll);
+    }
+    if (m_table->horizontalScrollBar()) {
+        m_table->horizontalScrollBar()->setValue(savedHScroll);
+    }
+    fitTableColumnsToContents(/*allowShrink=*/!m_initialColumnFitDone || structureChanged);
+    m_table->setUpdatesEnabled(true);
+}
+
+void MainWindow::restoreTableSelection(const QString& targetWorkerId, int preferredCol)
+{
+    if (!m_table || !m_table->selectionModel()) return;
+    QScopedValueRollback<bool> guard(m_rebuildingTable, true);
+
+    const int col = qBound(0, preferredCol, qMax(0, m_table->columnCount() - 2));
+    int targetRow = -1;
+    if (!targetWorkerId.isEmpty()) {
+        for (int r = 0; r < m_table->rowCount(); ++r) {
+            if (QTableWidgetItem* it = m_table->item(r, 0)) {
+                if (it->data(Qt::UserRole).toString() == targetWorkerId) {
+                    targetRow = r;
+                    break;
+                }
+            }
         }
     }
-    if (m_table->verticalScrollBar()) {
-        m_table->verticalScrollBar()->setValue(savedScroll);
+
+    if (targetRow >= 0) {
+        if (!m_table->isRowHidden(targetRow)) {
+            const QModelIndex idx = m_table->model()->index(targetRow, col);
+            m_table->selectionModel()->setCurrentIndex(
+                idx,
+                QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+        } else {
+            m_table->clearSelection();
+            m_table->selectionModel()->clearCurrentIndex();
+        }
+        return;
+    }
+
+    int firstVisible = -1;
+    for (int r = 0; r < m_table->rowCount(); ++r) {
+        if (!m_table->isRowHidden(r)) {
+            firstVisible = r;
+            break;
+        }
+    }
+    if (firstVisible >= 0) {
+        const QModelIndex idx = m_table->model()->index(firstVisible, col);
+        m_table->selectionModel()->setCurrentIndex(
+            idx,
+            QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+        if (QTableWidgetItem* it = m_table->item(firstVisible, 0)) {
+            m_selectedWorkerId = it->data(Qt::UserRole).toString();
+        }
+    } else {
+        m_table->clearSelection();
+        m_table->selectionModel()->clearCurrentIndex();
+        m_selectedWorkerId.clear();
     }
 }
 
@@ -685,16 +935,16 @@ void MainWindow::applyFilters()
     const int tgtFilter = m_comboTargetFilter->currentData().toInt();
     const QString q = m_editSearch->text().trimmed();
 
-    m_pillAll->setProperty("active", m_statusFilter == 0);
-    m_pillRunning->setProperty("active", m_statusFilter == 1);
-    m_pillStopped->setProperty("active", m_statusFilter == 2);
-    m_pillWarnings->setProperty("active", m_statusFilter == 3);
-    for (QPushButton* pill : {m_pillAll, m_pillRunning, m_pillStopped, m_pillWarnings}) {
-        pill->style()->unpolish(pill);
-        pill->style()->polish(pill);
+    if (m_statusFilterGroup) {
+        if (QAbstractButton* btn = m_statusFilterGroup->button(m_statusFilter)) {
+            btn->setChecked(true);
+        }
     }
 
     int visible = 0;
+    int runningCount = 0;
+    int stoppedCount = 0;
+    int warnCount = 0;
     const int total = m_table->rowCount();
     for (int r = 0; r < total; ++r) {
         QTableWidgetItem* it = m_table->item(r, 0);
@@ -704,6 +954,10 @@ void MainWindow::applyFilters()
         const int eng = it->data(Qt::UserRole + 3).toInt();
         const int tgt = it->data(Qt::UserRole + 4).toInt();
         const QString blob = it->data(Qt::UserRole + 5).toString();
+
+        if (isRunning) ++runningCount;
+        else ++stoppedCount;
+        if (hasWarn) ++warnCount;
 
         bool hide = false;
         if (m_statusFilter == 1 && !isRunning) hide = true;
@@ -717,12 +971,18 @@ void MainWindow::applyFilters()
         m_table->setRowHidden(r, hide);
         if (!hide) ++visible;
     }
+
+    m_pillAll->setText(QStringLiteral("%1 (%2)").arg(KTr(QStringLiteral("filter.all"))).arg(total));
+    m_pillRunning->setText(QStringLiteral("%1 (%2)").arg(KTr(QStringLiteral("filter.running"))).arg(runningCount));
+    m_pillStopped->setText(QStringLiteral("%1 (%2)").arg(KTr(QStringLiteral("filter.stopped"))).arg(stoppedCount));
+    m_pillWarnings->setText(QStringLiteral("%1 (%2)").arg(KTr(QStringLiteral("filter.warnings"))).arg(warnCount));
     m_lblFilterCount->setText(QStringLiteral("%1 / %2").arg(visible).arg(total));
 }
 
 void MainWindow::onFilterChanged()
 {
     applyFilters();
+    restoreTableSelection(m_selectedWorkerId, m_table ? m_table->currentColumn() : 0);
 }
 
 void MainWindow::updateKpis()
@@ -774,10 +1034,20 @@ void MainWindow::updateKpis()
     m_kpiValWorkers->setText(QStringLiteral("%1 / %2").arg(running).arg(total));
     m_kpiSubWorkers->setText(QStringLiteral("CPU: %1 • GPU: %2").arg(cpuCount).arg(gpuCount));
 
+    auto setKpiWarnState = [](QLabel* lbl, bool warn) {
+        const QString target = warn ? QStringLiteral("warn") : QString();
+        if (lbl->property("state").toString() != target) {
+            lbl->setProperty("state", target);
+            lbl->style()->unpolish(lbl);
+            lbl->style()->polish(lbl);
+        }
+    };
+
     m_kpiValPool->setText(QStringLiteral("%1 / %2").arg(regCount).arg(total));
     m_kpiSubPool->setText(unregWasteCount > 0
         ? QStringLiteral("⚠ %1 running unreg").arg(unregWasteCount)
         : QStringLiteral("Pool total: %1").arg(poolSize));
+    setKpiWarnState(m_kpiSubPool, unregWasteCount > 0);
 
     m_kpiValHash->setText(formatHashrateKhs(sumKhs));
     m_kpiSubHash->setText(QStringLiteral("%1 active workers").arg(running));
@@ -796,16 +1066,48 @@ void MainWindow::updateKpis()
 
     m_kpiValNet->setText(bestHeight > 0 ? QStringLiteral("Block #%1").arg(bestHeight) : QStringLiteral("RPC Syncing..."));
     m_kpiSubNet->setText(doubleMineTargets > 0
-        ? QStringLiteral("⚠ %1 (%2 nodes)").arg(KTr(QStringLiteral("kpi.double_mine_warn"))).arg(doubleMineTargets)
+        ? QStringLiteral("%1 (%2 nodes)").arg(KTr(QStringLiteral("kpi.double_mine_warn"))).arg(doubleMineTargets)
         : KTr(QStringLiteral("kpi.double_mine_clean")));
+    setKpiWarnState(m_kpiSubNet, doubleMineTargets > 0);
+    updateInternalGenButton();
+}
+
+void MainWindow::updateInternalGenButton()
+{
+    if (!m_btnDisableGen) return;
+    QSet<QString> seen;
+    int reachableTargets = 0;
+    int enabledTargets = 0;
+    for (const WorkerProfile& p : m_controller->profiles()) {
+        if (p.targetType == TargetType::RemoteSsh) continue;
+        const QString tkey = p.targetKey();
+        if (seen.contains(tkey)) continue;
+        seen.insert(tkey);
+        const NodeMiningStatus ns = m_rpc->statusForTarget(tkey);
+        if (!ns.reachable) continue;
+        ++reachableTargets;
+        if (ns.internalGenerate) ++enabledTargets;
+    }
+    if (enabledTargets > 0) {
+        m_btnDisableGen->setText(KTr(QStringLiteral("btn.disable_gen")));
+        m_btnDisableGen->setToolTip(QStringLiteral("setgenerate false (%1 node(s))").arg(enabledTargets));
+    } else {
+        m_btnDisableGen->setText(KTr(QStringLiteral("btn.enable_gen")));
+        m_btnDisableGen->setToolTip(reachableTargets > 0
+            ? QStringLiteral("setgenerate true (%1 node(s))").arg(reachableTargets)
+            : KTr(QStringLiteral("pool.checking")));
+    }
 }
 
 void MainWindow::onRowSelectionChanged()
 {
+    if (m_rebuildingTable) return;
     const auto items = m_table->selectedItems();
     if (items.isEmpty()) return;
-    const QString id = m_table->item(items.first()->row(), 0)->data(Qt::UserRole).toString();
-    if (id != m_selectedWorkerId) {
+    QTableWidgetItem* it = m_table->item(items.first()->row(), 0);
+    if (!it) return;
+    const QString id = it->data(Qt::UserRole).toString();
+    if (!id.isEmpty() && id != m_selectedWorkerId) {
         m_selectedWorkerId = id;
         updateInspector();
     }
@@ -828,27 +1130,19 @@ void MainWindow::updateInspector()
     }
     const WorkerRuntime rt = m_controller->runtimeById(p.id);
     const PoolSeatInfo seat = m_rpc->seatInfoForAddress(p.coinbaseAddress);
-    const NodeMiningStatus ns = m_rpc->statusForTarget(p.targetKey());
 
     QString meta = QStringLiteral("%1  •  PID: %2").arg(p.name).arg(rt.pid > 0 ? QString::number(rt.pid) : QStringLiteral("—"));
     if (rt.adopted) meta += QStringLiteral(" (Adopted)");
     if (rt.lastBlock > 0) meta += QStringLiteral("  •  Block #%1").arg(rt.lastBlock);
     m_lblInspectorMeta->setText(meta);
 
-    const bool wasteWarn = rt.warningDeferred || (seat.known && !seat.registered);
-    const bool doubleMineWarn = ns.reachable && ns.internalGenerate;
-    if (wasteWarn || doubleMineWarn) {
-        QStringList msgs;
-        if (wasteWarn) {
-            msgs << (rt.warningDeferred && !rt.warningDeferredMsg.isEmpty()
-                     ? (KTr(QStringLiteral("warn.waste_banner")) + QStringLiteral(" (") + rt.warningDeferredMsg + QLatin1Char(')'))
-                     : KTr(QStringLiteral("warn.waste_banner")));
-        }
-        if (doubleMineWarn) {
-            msgs << KTr(QStringLiteral("warn.double_banner"));
-        }
-        m_lblWarnBanner->setText(msgs.join(QLatin1Char('\n')));
-        m_btnFixDoubleMine->setVisible(doubleMineWarn);
+    const bool wasteWarn = rt.warningDeferred || (!p.coinbaseAddress.isEmpty() && seat.known && !seat.registered);
+    if (wasteWarn) {
+        const QString msg = (rt.warningDeferred && !rt.warningDeferredMsg.isEmpty())
+            ? (KTr(QStringLiteral("warn.waste_banner")) + QStringLiteral(" (") + rt.warningDeferredMsg + QLatin1Char(')'))
+            : KTr(QStringLiteral("warn.waste_banner"));
+        m_lblWarnBanner->setText(msg);
+        m_btnFixDoubleMine->setVisible(false);
         m_warnBanner->setVisible(true);
     } else {
         m_warnBanner->setVisible(false);
@@ -880,6 +1174,8 @@ void MainWindow::onAddWorker()
     if (dlg.exec() == QDialog::Accepted) {
         const QString newId = m_controller->addProfile(dlg.resultProfile());
         m_selectedWorkerId = newId;
+        restoreTableSelection(m_selectedWorkerId, 0);
+        updateInspector();
         m_rpc->refreshTargets(m_controller->profiles());
     }
 }
@@ -930,18 +1226,47 @@ void MainWindow::onStopUnregistered()
     m_controller->stopUnregisteredOrDeferred();
 }
 
-void MainWindow::onDisableAllDoubleMining()
+void MainWindow::onToggleAllInternalGen()
 {
-    QSet<QString> handled;
+    QSet<QString> seen;
+    QVector<WorkerProfile> enabledProfiles;
+    QVector<WorkerProfile> disabledProfiles;
     for (const WorkerProfile& p : m_controller->profiles()) {
         if (p.targetType == TargetType::RemoteSsh) continue;
         const QString tkey = p.targetKey();
-        if (handled.contains(tkey)) continue;
+        if (seen.contains(tkey)) continue;
+        seen.insert(tkey);
         const NodeMiningStatus ns = m_rpc->statusForTarget(tkey);
-        if (ns.reachable && ns.internalGenerate) {
-            handled.insert(tkey);
-            m_rpc->setInternalGenerate(p, false, nullptr);
+        if (!ns.reachable) continue;
+        if (ns.internalGenerate) {
+            enabledProfiles.append(p);
+        } else {
+            disabledProfiles.append(p);
         }
+    }
+
+    const bool targetEnable = enabledProfiles.isEmpty();
+    const QVector<WorkerProfile>& batch = targetEnable ? disabledProfiles : enabledProfiles;
+    if (batch.isEmpty()) {
+        return;
+    }
+
+    auto remaining = std::make_shared<int>(batch.size());
+    auto firstError = std::make_shared<QString>();
+    QPointer<MainWindow> self(this);
+    for (const WorkerProfile& p : batch) {
+        m_rpc->setInternalGenerate(p, targetEnable, [self, remaining, firstError](bool ok, const QString& err) {
+            if (!ok && firstError->isEmpty() && !err.isEmpty()) {
+                *firstError = err;
+            }
+            --(*remaining);
+            if (*remaining <= 0 && self) {
+                self->m_rpc->refreshTargets(self->m_controller->profiles());
+                if (!firstError->isEmpty()) {
+                    QMessageBox::warning(self, KTr(QStringLiteral("app.title")), *firstError);
+                }
+            }
+        });
     }
 }
 
