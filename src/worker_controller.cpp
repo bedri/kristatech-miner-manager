@@ -6,6 +6,7 @@
 #include <QFileInfo>
 #include <QProcess>
 #include <QRegularExpression>
+#include <QSet>
 #include <QStandardPaths>
 #include <QTimer>
 
@@ -25,6 +26,17 @@ QString shellQuote(const QString& s)
     QString escaped = s;
     escaped.replace(QLatin1Char('\''), QStringLiteral("'\\''"));
     return QLatin1Char('\'') + escaped + QLatin1Char('\'');
+}
+
+QString shellQuoteRemotePath(const QString& path)
+{
+    if (path == QStringLiteral("~")) {
+        return QStringLiteral("$HOME");
+    }
+    if (path.startsWith(QStringLiteral("~/"))) {
+        return QStringLiteral("$HOME/") + shellQuote(path.mid(2));
+    }
+    return shellQuote(path);
 }
 
 double scaleHashrateToKhs(double value, const QString& unit)
@@ -164,6 +176,33 @@ void terminateProcessByPid(qint64 pid, bool force)
 #endif
 }
 
+void stopQProcessSync(QProcess* proc, QObject* receiver)
+{
+    if (!proc) return;
+    proc->disconnect(receiver);
+    if (proc->state() != QProcess::NotRunning) {
+        proc->terminate();
+        if (!proc->waitForFinished(300)) {
+            proc->kill();
+            proc->waitForFinished(300);
+        }
+    }
+}
+
+void discardAsyncProcess(QProcess*& procPtr, QObject* receiver)
+{
+    if (!procPtr) return;
+    QProcess* proc = procPtr;
+    procPtr = nullptr;
+    proc->disconnect(receiver);
+    if (proc->state() != QProcess::NotRunning) {
+        QObject::connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                         proc, &QProcess::deleteLater);
+    } else {
+        proc->deleteLater();
+    }
+}
+
 } // namespace
 
 WorkerController::WorkerController(ConfigStore* store, RpcClient* rpc, QObject* parent)
@@ -183,19 +222,18 @@ WorkerController::WorkerController(ConfigStore* store, RpcClient* rpc, QObject* 
 WorkerController::~WorkerController()
 {
     detachSshLogTail(QString());
+    for (QProcess* proc : m_sshStartProcs) {
+        stopQProcessSync(proc, this);
+    }
+    m_sshStartProcs.clear();
+    m_sshTailBuffers.clear();
+    m_sshHealthInflight.clear();
     for (QProcess* proc : m_podmanStartProcs) {
-        if (proc) {
-            proc->disconnect(this);
-            if (proc->state() != QProcess::NotRunning) {
-                proc->terminate();
-                if (!proc->waitForFinished(300)) {
-                    proc->kill();
-                    proc->waitForFinished(300);
-                }
-            }
-        }
+        stopQProcessSync(proc, this);
     }
     m_podmanStartProcs.clear();
+    stopQProcessSync(m_podmanNsCheckProc, this);
+    m_podmanNsCheckProc = nullptr;
 }
 
 WorkerProfile WorkerController::profileById(const QString& id) const
@@ -301,6 +339,8 @@ bool WorkerController::removeProfile(const QString& id, bool stopIfRunning)
         stopWorker(id);
     }
     m_podmanStartProcs.take(id);
+    m_sshStartProcs.take(id);
+    m_sshHealthInflight.remove(id);
     detachSshLogTail(id);
     QFile::remove(m_store->runtimeJsonPath(id));
     m_profiles.removeAt(idx);
@@ -377,7 +417,7 @@ void WorkerController::startWorker(const QString& id)
 {
     const int idx = indexOfId(id);
     if (idx < 0) return;
-    if (m_podmanStartProcs.contains(id)) return;
+    if (m_podmanStartProcs.contains(id) || m_sshStartProcs.contains(id)) return;
 
     const WorkerProfile& p = m_profiles[idx];
     WorkerRuntime& rt = m_runtimes[id];
@@ -689,9 +729,11 @@ void WorkerController::launchLocalOrPodmanWithPid(const WorkerProfile& p,
 
 void WorkerController::startRemoteSsh(const WorkerProfile& p, WorkerRuntime& rt)
 {
-    if (!isValidWorkerId(p.id) || p.sshTarget.trimmed().isEmpty()) {
+    const QString sshTarget = p.sshTarget.trimmed();
+    if (!isValidWorkerId(p.id) || !isValidSshTarget(sshTarget)) {
         rt.status = WorkerStatus::Error;
         rt.lastError = QStringLiteral("Invalid SSH target or worker ID");
+        appendSanitizedLines(p.id, rt, {QStringLiteral("[KMM] ERROR: ") + rt.lastError});
         return;
     }
     const RpcCredentials creds = ConfigStore::resolveCredentials(p);
@@ -699,6 +741,14 @@ void WorkerController::startRemoteSsh(const WorkerProfile& p, WorkerRuntime& rt)
         rt.status = WorkerStatus::Error;
         rt.lastError = creds.error;
         appendSanitizedLines(p.id, rt, {QStringLiteral("[KMM] ERROR: ") + creds.error});
+        return;
+    }
+
+    const QString sshBin = QStandardPaths::findExecutable(QStringLiteral("ssh"));
+    if (sshBin.isEmpty()) {
+        rt.status = WorkerStatus::Error;
+        rt.lastError = QStringLiteral("ssh executable not found in PATH");
+        appendSanitizedLines(p.id, rt, {QStringLiteral("[KMM] ERROR: ") + rt.lastError});
         return;
     }
 
@@ -712,26 +762,42 @@ void WorkerController::startRemoteSsh(const WorkerProfile& p, WorkerRuntime& rt)
         : p.remoteBinaryPath.trimmed();
 
     QProcess* uploadProc = new QProcess(this);
-    const QString uploadCmd = QStringLiteral("umask 077 && mkdir -p ~/.kristatech-mm && cat > ") + remoteJson;
-    uploadProc->start(QStringLiteral("ssh"),
-                      {QStringLiteral("-o"), QStringLiteral("BatchMode=yes"),
-                       QStringLiteral("-o"), QStringLiteral("ConnectTimeout=8"),
-                       QStringLiteral("-p"), portStr,
-                       p.sshTarget.trimmed(), uploadCmd});
-    uploadProc->write(jsonBytes);
-    uploadProc->closeWriteChannel();
-
+    m_sshStartProcs.insert(p.id, uploadProc);
     const QString workerId = p.id;
+
+    connect(uploadProc, &QProcess::errorOccurred, this, [this, uploadProc, workerId](QProcess::ProcessError err) {
+        if (err != QProcess::FailedToStart) return;
+        if (m_sshStartProcs.value(workerId) != uploadProc) {
+            uploadProc->deleteLater();
+            return;
+        }
+        m_sshStartProcs.remove(workerId);
+        const QString msg = QStringLiteral("Failed to launch ssh: ") + uploadProc->errorString();
+        uploadProc->deleteLater();
+        if (!m_runtimes.contains(workerId)) return;
+        WorkerRuntime& cur = m_runtimes[workerId];
+        if (cur.userStopped) return;
+        cur.status = WorkerStatus::Error;
+        cur.lastError = msg;
+        appendSanitizedLines(workerId, cur, {QStringLiteral("[KMM] ERROR: ") + cur.lastError});
+        Q_EMIT workersChanged();
+    });
+
     connect(uploadProc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, [this, uploadProc, workerId, p, remoteBin, remoteJson, remoteLog, remotePid, portStr](int code, QProcess::ExitStatus) {
+            this, [this, uploadProc, workerId, p, sshBin, sshTarget, remoteBin, remoteJson, remoteLog, remotePid, portStr](int code, QProcess::ExitStatus exitStatus) {
                 const QString uErr = QString::fromUtf8(uploadProc->readAllStandardError()).trimmed();
+                if (m_sshStartProcs.value(workerId) != uploadProc) {
+                    uploadProc->deleteLater();
+                    return;
+                }
+                m_sshStartProcs.remove(workerId);
                 uploadProc->deleteLater();
                 if (!m_runtimes.contains(workerId)) return;
                 WorkerRuntime& cur = m_runtimes[workerId];
                 if (cur.userStopped) return;
-                if (code != 0) {
+                if (exitStatus != QProcess::NormalExit || code != 0) {
                     cur.status = WorkerStatus::Error;
-                    cur.lastError = QStringLiteral("SSH upload failed: ") + uErr;
+                    cur.lastError = QStringLiteral("SSH upload failed: ") + (uErr.isEmpty() ? QStringLiteral("exit code %1").arg(code) : uErr);
                     appendSanitizedLines(workerId, cur, {QStringLiteral("[KMM] ERROR: ") + cur.lastError});
                     Q_EMIT workersChanged();
                     return;
@@ -745,28 +811,55 @@ void WorkerController::startRemoteSsh(const WorkerProfile& p, WorkerRuntime& rt)
                 if (!p.cpuAffinity.trimmed().isEmpty() && isValidCpuAffinity(p.cpuAffinity)) {
                     launchCmd += QStringLiteral("taskset -c ") + shellQuote(p.cpuAffinity.trimmed()) + QLatin1Char(' ');
                 }
-                launchCmd += shellQuote(remoteBin) + QStringLiteral(" -c ") + remoteJson;
+                launchCmd += shellQuoteRemotePath(remoteBin) + QStringLiteral(" -c ") + remoteJson;
                 if (!quotedExtra.isEmpty()) {
                     launchCmd += QLatin1Char(' ') + quotedExtra.join(QLatin1Char(' '));
                 }
                 const QString remoteWrap = QStringLiteral(
-                    "nohup %1 </dev/null >%2 2>&1 & echo $! > %3 && sleep 0.3 && cat %3")
+                    "nohup %1 </dev/null >%2 2>&1 & P=$!; echo \"$P\" > %3; sleep 0.3; "
+                    "if kill -0 \"$P\" 2>/dev/null; then echo \"$P\"; "
+                    "else tail -n 5 %2 >&2; rm -f %3; exit 1; fi")
                     .arg(launchCmd, remoteLog, remotePid);
 
                 QProcess* startProc = new QProcess(this);
-                startProc->start(QStringLiteral("ssh"),
-                                 {QStringLiteral("-o"), QStringLiteral("BatchMode=yes"),
-                                  QStringLiteral("-o"), QStringLiteral("ConnectTimeout=8"),
-                                  QStringLiteral("-p"), portStr,
-                                  p.sshTarget.trimmed(), remoteWrap});
+                m_sshStartProcs.insert(workerId, startProc);
+
+                connect(startProc, &QProcess::errorOccurred, this, [this, startProc, workerId](QProcess::ProcessError err) {
+                    if (err != QProcess::FailedToStart) return;
+                    if (m_sshStartProcs.value(workerId) != startProc) {
+                        startProc->deleteLater();
+                        return;
+                    }
+                    m_sshStartProcs.remove(workerId);
+                    const QString msg = QStringLiteral("Failed to launch ssh: ") + startProc->errorString();
+                    startProc->deleteLater();
+                    if (!m_runtimes.contains(workerId)) return;
+                    WorkerRuntime& r = m_runtimes[workerId];
+                    if (r.userStopped) return;
+                    r.status = WorkerStatus::Error;
+                    r.lastError = msg;
+                    appendSanitizedLines(workerId, r, {QStringLiteral("[KMM] ERROR: ") + r.lastError});
+                    Q_EMIT workersChanged();
+                });
+
                 connect(startProc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-                        this, [this, startProc, workerId, p](int scode, QProcess::ExitStatus) {
+                        this, [this, startProc, workerId, p, sshTarget](int scode, QProcess::ExitStatus sStatus) {
                             const QString out = QString::fromUtf8(startProc->readAllStandardOutput()).trimmed();
                             const QString serr = QString::fromUtf8(startProc->readAllStandardError()).trimmed();
+                            const bool stillInflight = (m_sshStartProcs.value(workerId) == startProc);
+                            if (stillInflight) {
+                                m_sshStartProcs.remove(workerId);
+                            }
                             startProc->deleteLater();
                             if (!m_runtimes.contains(workerId)) return;
                             WorkerRuntime& r = m_runtimes[workerId];
-                            if (scode != 0 || out.toLongLong() <= 0) {
+                            if (!stillInflight || r.userStopped) {
+                                if (sStatus == QProcess::NormalExit && scode == 0 && out.toLongLong() > 0) {
+                                    stopRemoteSsh(p, r);
+                                }
+                                return;
+                            }
+                            if (sStatus != QProcess::NormalExit || scode != 0 || out.toLongLong() <= 0) {
                                 r.status = WorkerStatus::Error;
                                 r.lastError = QStringLiteral("Remote SSH start failed: ") + (serr.isEmpty() ? out : serr);
                                 appendSanitizedLines(workerId, r, {QStringLiteral("[KMM] ERROR: ") + r.lastError});
@@ -776,18 +869,42 @@ void WorkerController::startRemoteSsh(const WorkerProfile& p, WorkerRuntime& rt)
                                 r.lastActiveEpochMs = QDateTime::currentMSecsSinceEpoch();
                                 appendSanitizedLines(workerId, r,
                                                      {QStringLiteral("[KMM] Started remote worker on %1 (PID %2)")
-                                                          .arg(p.sshTarget, out)});
+                                                          .arg(sshTarget, out)});
                                 attachSshLogTail(p);
+                                if (p.disableInternalGenOnStart && m_rpc) {
+                                    m_rpc->setInternalGenerate(p, false, nullptr);
+                                }
                             }
                             Q_EMIT workersChanged();
                         });
+
+                startProc->start(sshBin,
+                                 {QStringLiteral("-o"), QStringLiteral("BatchMode=yes"),
+                                  QStringLiteral("-o"), QStringLiteral("ConnectTimeout=8"),
+                                  QStringLiteral("-p"), portStr,
+                                  QStringLiteral("--"),
+                                  sshTarget, remoteWrap});
             });
+
+    const QString uploadCmd = QStringLiteral("umask 077 && mkdir -p ~/.kristatech-mm && cat > ") + remoteJson;
+    uploadProc->start(sshBin,
+                      {QStringLiteral("-o"), QStringLiteral("BatchMode=yes"),
+                       QStringLiteral("-o"), QStringLiteral("ConnectTimeout=8"),
+                       QStringLiteral("-p"), portStr,
+                       QStringLiteral("--"),
+                       sshTarget, uploadCmd});
+    uploadProc->write(jsonBytes);
+    uploadProc->closeWriteChannel();
 }
 
 void WorkerController::attachSshLogTail(const WorkerProfile& p)
 {
     detachSshLogTail(p.id);
-    if (!isValidWorkerId(p.id) || p.sshTarget.trimmed().isEmpty()) return;
+    const QString sshTarget = p.sshTarget.trimmed();
+    if (!isValidWorkerId(p.id) || !isValidSshTarget(sshTarget)) return;
+
+    const QString sshBin = QStandardPaths::findExecutable(QStringLiteral("ssh"));
+    if (sshBin.isEmpty()) return;
 
     QProcess* tailProc = new QProcess(this);
     const QString portStr = QString::number(p.sshPort > 0 ? p.sshPort : 22);
@@ -795,9 +912,32 @@ void WorkerController::attachSshLogTail(const WorkerProfile& p)
 
     connect(tailProc, &QProcess::readyReadStandardOutput, this, [this, tailProc, workerId]() {
         if (!m_runtimes.contains(workerId)) return;
-        const QString text = QString::fromUtf8(tailProc->readAllStandardOutput());
-        const QStringList lines = text.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
-        appendSanitizedLines(workerId, m_runtimes[workerId], lines);
+        QByteArray& buf = m_sshTailBuffers[workerId];
+        buf.append(tailProc->readAllStandardOutput());
+        int nl = -1;
+        QStringList completeLines;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+            QByteArray lineBytes = buf.left(nl);
+            if (!lineBytes.isEmpty() && lineBytes.endsWith('\r')) {
+                lineBytes.chop(1);
+            }
+            buf.remove(0, nl + 1);
+            const QString line = QString::fromUtf8(lineBytes).trimmed();
+            if (!line.isEmpty()) {
+                completeLines.append(line);
+            }
+        }
+        if (!completeLines.isEmpty()) {
+            appendSanitizedLines(workerId, m_runtimes[workerId], completeLines);
+            Q_EMIT workersChanged();
+        }
+    });
+    connect(tailProc, &QProcess::errorOccurred, this, [this, tailProc, workerId](QProcess::ProcessError err) {
+        if (err != QProcess::FailedToStart) return;
+        if (m_sshTailProcs.value(workerId) == tailProc) {
+            m_sshTailProcs.remove(workerId);
+        }
+        tailProc->deleteLater();
     });
     connect(tailProc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
             this, [this, tailProc, workerId](int, QProcess::ExitStatus) {
@@ -808,11 +948,12 @@ void WorkerController::attachSshLogTail(const WorkerProfile& p)
             });
 
     m_sshTailProcs.insert(p.id, tailProc);
-    tailProc->start(QStringLiteral("ssh"),
+    tailProc->start(sshBin,
                     {QStringLiteral("-o"), QStringLiteral("BatchMode=yes"),
                      QStringLiteral("-o"), QStringLiteral("ServerAliveInterval=15"),
                      QStringLiteral("-p"), portStr,
-                     p.sshTarget.trimmed(),
+                     QStringLiteral("--"),
+                     sshTarget,
                      QStringLiteral("tail -n 60 -F ~/.kristatech-mm/%1.log").arg(p.id)});
 }
 
@@ -828,8 +969,10 @@ void WorkerController::detachSshLogTail(const QString& id)
             }
         }
         m_sshTailProcs.clear();
+        m_sshTailBuffers.clear();
         return;
     }
+    m_sshTailBuffers.remove(id);
     if (QProcess* proc = m_sshTailProcs.take(id)) {
         proc->terminate();
         proc->waitForFinished(300);
@@ -843,25 +986,35 @@ void WorkerController::detachSshLogTail(const QString& id)
 void WorkerController::stopRemoteSsh(const WorkerProfile& p, WorkerRuntime& rt)
 {
     detachSshLogTail(p.id);
-    if (!isValidWorkerId(p.id) || p.sshTarget.trimmed().isEmpty()) return;
+    const QString sshTarget = p.sshTarget.trimmed();
+    if (!isValidWorkerId(p.id) || !isValidSshTarget(sshTarget)) return;
+
+    const QString sshBin = QStandardPaths::findExecutable(QStringLiteral("ssh"));
+    if (sshBin.isEmpty()) return;
 
     const QString portStr = QString::number(p.sshPort > 0 ? p.sshPort : 22);
     const QString cmd = QStringLiteral(
         "if [ -f ~/.kristatech-mm/%1.pid ]; then "
-        "P=$(cat ~/.kristatech-mm/%1.pid); "
+        "P=\"$(cat ~/.kristatech-mm/%1.pid)\"; "
         "kill -TERM \"$P\" 2>/dev/null || true; "
         "fi; rm -f ~/.kristatech-mm/%1.json ~/.kristatech-mm/%1.pid")
         .arg(p.id);
 
     QProcess* proc = new QProcess(this);
+    connect(proc, &QProcess::errorOccurred, proc, [proc](QProcess::ProcessError err) {
+        if (err == QProcess::FailedToStart) {
+            proc->deleteLater();
+        }
+    });
     connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
             proc, &QProcess::deleteLater);
-    proc->start(QStringLiteral("ssh"),
+    proc->start(sshBin,
                 {QStringLiteral("-o"), QStringLiteral("BatchMode=yes"),
                  QStringLiteral("-o"), QStringLiteral("ConnectTimeout=6"),
                  QStringLiteral("-p"), portStr,
-                 p.sshTarget.trimmed(), cmd});
-    appendSanitizedLines(p.id, rt, {QStringLiteral("[KMM] Sent stop signal to remote host ") + p.sshTarget});
+                 QStringLiteral("--"),
+                 sshTarget, cmd});
+    appendSanitizedLines(p.id, rt, {QStringLiteral("[KMM] Sent stop signal to remote host ") + sshTarget});
 }
 
 void WorkerController::stopWorker(const QString& id)
@@ -870,6 +1023,8 @@ void WorkerController::stopWorker(const QString& id)
     if (idx < 0) return;
 
     m_podmanStartProcs.take(id);
+    m_sshStartProcs.take(id);
+    m_sshHealthInflight.remove(id);
     const WorkerProfile& p = m_profiles[idx];
     WorkerRuntime& rt = m_runtimes[id];
     rt.userStopped = true;
@@ -930,7 +1085,7 @@ void WorkerController::startAll()
 {
     for (const WorkerProfile& p : m_profiles) {
         if (!p.enabled) continue;
-        if (m_podmanStartProcs.contains(p.id)) continue;
+        if (m_podmanStartProcs.contains(p.id) || m_sshStartProcs.contains(p.id)) continue;
         const WorkerRuntime& rt = m_runtimes.value(p.id);
         if (rt.status == WorkerStatus::Starting) continue;
         if (rt.pid <= 0 || rt.status == WorkerStatus::Stopped || rt.status == WorkerStatus::Error) {
@@ -1067,7 +1222,30 @@ void WorkerController::clearWorkerLog(const QString& id)
 bool WorkerController::matchesProcess(const WorkerProfile& p, const DiscoveredProcess& dp) const
 {
     if (p.engine != dp.engine) return false;
+    if (p.targetType == TargetType::RemoteSsh) return false;
+
+    if (p.targetType == TargetType::CustomRpc) {
+        if (dp.targetType != TargetType::CustomRpc && dp.targetType != TargetType::LocalWallet) {
+            return false;
+        }
+        const QString profUrl = normalizeRpcUrl(p.rpcUrl);
+        const QString procUrl = normalizeRpcUrl(dp.rpcUrl);
+        if (profUrl.isEmpty() || procUrl.isEmpty() || profUrl != procUrl) {
+            return false;
+        }
+        if (!p.coinbaseAddress.isEmpty() && !dp.coinbaseAddress.isEmpty()
+            && p.coinbaseAddress != dp.coinbaseAddress) {
+            return false;
+        }
+        return true;
+    }
+
     if (p.targetType != dp.targetType) return false;
+    if (p.targetType == TargetType::LocalWallet
+        && !dp.rpcUrl.isEmpty()
+        && !isLoopbackRpcUrl(dp.rpcUrl)) {
+        return false;
+    }
     if (p.targetType == TargetType::PodmanContainer && p.podmanName != dp.podmanName) {
         return false;
     }
@@ -1225,6 +1403,10 @@ void WorkerController::stopAllManagedAndCleanup()
     m_logTimer.stop();
     m_healthTimer.stop();
     detachSshLogTail(QString());
+    m_podmanStartProcs.clear();
+    m_sshStartProcs.clear();
+    m_sshHealthInflight.clear();
+    discardAsyncProcess(m_podmanNsCheckProc, this);
 
     for (const WorkerProfile& p : m_profiles) {
         if (p.targetType == TargetType::RemoteSsh) continue;
@@ -1253,7 +1435,151 @@ void WorkerController::detachAll()
     m_logTimer.stop();
     m_healthTimer.stop();
     detachSshLogTail(QString());
+    m_sshStartProcs.clear();
+    m_sshHealthInflight.clear();
+    discardAsyncProcess(m_podmanNsCheckProc, this);
     saveProfiles();
+}
+
+void WorkerController::setNetNsResolverForTest(std::function<QString(qint64)> resolver)
+{
+    m_netNsResolver = std::move(resolver);
+}
+
+void WorkerController::checkPodmanNamespacesNow()
+{
+#ifdef Q_OS_WIN
+    return;
+#else
+    if (m_podmanNsCheckProc != nullptr) {
+        return;
+    }
+
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    QStringList podNames;
+    QSet<QString> seenPods;
+    for (const WorkerProfile& p : m_profiles) {
+        if (p.targetType != TargetType::PodmanContainer) continue;
+        if (m_podmanStartProcs.contains(p.id)) continue;
+
+        const WorkerRuntime rt = m_runtimes.value(p.id);
+        if (rt.userStopped || rt.pid <= 1) continue;
+        if (rt.status == WorkerStatus::Stopped || rt.status == WorkerStatus::Error
+            || rt.status == WorkerStatus::Starting || rt.status == WorkerStatus::Restarting) {
+            continue;
+        }
+        if (!m_netNsResolver && rt.startedAtEpochMs > 0 && (now - rt.startedAtEpochMs) < 5000) {
+            continue;
+        }
+        if (!m_netNsResolver && rt.wrapperPid > 0 && rt.pid == rt.wrapperPid) {
+            continue;
+        }
+
+        const QString podName = p.podmanName.trimmed();
+        if (!isValidPodmanName(podName) || seenPods.contains(podName)) {
+            continue;
+        }
+        seenPods.insert(podName);
+        podNames.append(podName);
+    }
+
+    if (podNames.isEmpty()) {
+        return;
+    }
+
+    const QString podmanBin = QStandardPaths::findExecutable(QStringLiteral("podman"));
+    if (podmanBin.isEmpty()) {
+        return;
+    }
+
+    QProcess* proc = new QProcess(this);
+    m_podmanNsCheckProc = proc;
+
+    connect(proc, &QProcess::errorOccurred, this, [this, proc](QProcess::ProcessError err) {
+        if (err != QProcess::FailedToStart) return;
+        if (m_podmanNsCheckProc == proc) {
+            m_podmanNsCheckProc = nullptr;
+        }
+        proc->deleteLater();
+    });
+
+    connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
+            [this, proc](int, QProcess::ExitStatus exitStatus) {
+                if (m_podmanNsCheckProc == proc) {
+                    m_podmanNsCheckProc = nullptr;
+                }
+                const QByteArray outBytes = proc->readAllStandardOutput();
+                proc->deleteLater();
+
+                if (exitStatus != QProcess::NormalExit) {
+                    return;
+                }
+
+                QHash<QString, qint64> runningPodPids;
+                const QStringList lines = QString::fromUtf8(outBytes).split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+                static const QRegularExpression reWs(QStringLiteral("\\s+"));
+                for (const QString& raw : lines) {
+                    const QStringList parts = raw.trimmed().split(reWs, Qt::SkipEmptyParts);
+                    if (parts.size() < 3) continue;
+                    QString name = parts[0];
+                    if (name.startsWith(QLatin1Char('/'))) {
+                        name.remove(0, 1);
+                    }
+                    const bool running = (parts[1].compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0);
+                    bool okPid = false;
+                    const qint64 podPid = parts[2].toLongLong(&okPid);
+                    if (running && okPid && podPid > 0) {
+                        runningPodPids.insert(name, podPid);
+                    }
+                }
+
+                if (runningPodPids.isEmpty()) {
+                    return;
+                }
+
+                auto resolveNs = m_netNsResolver
+                    ? m_netNsResolver
+                    : [](qint64 pid) { return ProcessScanner::readProcessNetNs(pid); };
+
+                QStringList idsToReattach;
+                for (const WorkerProfile& p : m_profiles) {
+                    if (p.targetType != TargetType::PodmanContainer) continue;
+                    if (m_podmanStartProcs.contains(p.id)) continue;
+
+                    const QString podName = p.podmanName.trimmed();
+                    if (!runningPodPids.contains(podName)) continue;
+
+                    const WorkerRuntime rt = m_runtimes.value(p.id);
+                    if (rt.userStopped || rt.pid <= 1) continue;
+                    if (rt.status == WorkerStatus::Stopped || rt.status == WorkerStatus::Error
+                        || rt.status == WorkerStatus::Starting || rt.status == WorkerStatus::Restarting) {
+                        continue;
+                    }
+                    if (!m_netNsResolver && rt.wrapperPid > 0 && rt.pid == rt.wrapperPid) {
+                        continue;
+                    }
+
+                    const qint64 podPid = runningPodPids.value(podName);
+                    const QString minerNs = resolveNs(rt.pid);
+                    const QString podNs = resolveNs(podPid);
+                    if (!minerNs.isEmpty() && !podNs.isEmpty() && minerNs != podNs) {
+                        appendSanitizedLines(
+                            p.id, m_runtimes[p.id],
+                            {QStringLiteral("[KMM] Podman container '%1' restarted (stale netns %2 != %3); reattaching worker...")
+                                 .arg(podName, minerNs, podNs)});
+                        idsToReattach.append(p.id);
+                    }
+                }
+
+                for (const QString& id : idsToReattach) {
+                    restartWorker(id);
+                }
+            });
+
+    QStringList args{QStringLiteral("inspect")};
+    args << podNames << QStringLiteral("--format") << QStringLiteral("{{.Name}}\t{{.State.Running}}\t{{.State.Pid}}");
+    proc->start(podmanBin, args);
+#endif
 }
 
 void WorkerController::appendSanitizedLines(const QString& id, WorkerRuntime& rt, const QStringList& lines)
@@ -1322,6 +1648,109 @@ void WorkerController::onLogPollTick()
     }
 }
 
+void WorkerController::markWorkerCrashedOrScheduleRestart(const WorkerProfile& p,
+                                                            WorkerRuntime& rt,
+                                                            const QString& processLabel)
+{
+    rt.pid = 0;
+    rt.wrapperPid = 0;
+    rt.hashrateKhs = 0.0;
+    rt.hashrateDisplay.clear();
+
+    if (!rt.userStopped && p.autoRestart && p.enabled) {
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        rt.restartAttempts = qMin(rt.restartAttempts + 1, 6);
+        const qint64 delayMs = qMin<qint64>(30000, 3000 * (1LL << (rt.restartAttempts - 1)));
+        rt.nextRetryEpochMs = now + delayMs;
+        rt.status = WorkerStatus::Restarting;
+        appendSanitizedLines(p.id, rt,
+                             {QStringLiteral("[KMM] %1 exited; restarting in %2s (attempt #%3)")
+                                  .arg(processLabel)
+                                  .arg(delayMs / 1000)
+                                  .arg(rt.restartAttempts)});
+    } else {
+        rt.status = WorkerStatus::Error;
+        rt.lastError = processLabel + QStringLiteral(" exited unexpectedly");
+        appendSanitizedLines(p.id, rt, {QStringLiteral("[KMM] ERROR: ") + rt.lastError});
+    }
+}
+
+void WorkerController::checkRemoteSshHealthNow()
+{
+    const QString sshBin = QStandardPaths::findExecutable(QStringLiteral("ssh"));
+    if (sshBin.isEmpty()) {
+        return;
+    }
+
+    for (const WorkerProfile& p : m_profiles) {
+        if (p.targetType != TargetType::RemoteSsh) continue;
+        const QString id = p.id;
+        const QString sshTarget = p.sshTarget.trimmed();
+        if (!isValidWorkerId(id) || !isValidSshTarget(sshTarget)) continue;
+        if (m_sshStartProcs.contains(id) || m_sshHealthInflight.contains(id)) continue;
+
+        const WorkerRuntime rt = m_runtimes.value(id);
+        if (rt.userStopped || rt.status == WorkerStatus::Stopped
+            || rt.status == WorkerStatus::Starting
+            || rt.status == WorkerStatus::Error
+            || rt.status == WorkerStatus::Restarting) {
+            continue;
+        }
+
+        m_sshHealthInflight.insert(id);
+        QProcess* chk = new QProcess(this);
+        auto completed = std::make_shared<bool>(false);
+        const QString portStr = QString::number(p.sshPort > 0 ? p.sshPort : 22);
+        const QString remoteCmd = QStringLiteral(
+            "if [ -f ~/.kristatech-mm/%1.pid ] && kill -0 \"$(cat ~/.kristatech-mm/%1.pid)\" 2>/dev/null; then "
+            "cat ~/.kristatech-mm/%1.pid; else echo DEAD; fi").arg(id);
+
+        connect(chk, &QProcess::errorOccurred, this, [this, chk, id, completed](QProcess::ProcessError err) {
+            if (err != QProcess::FailedToStart || *completed) return;
+            *completed = true;
+            m_sshHealthInflight.remove(id);
+            chk->deleteLater();
+        });
+
+        connect(chk, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                this, [this, chk, id, completed](int code, QProcess::ExitStatus exitStatus) {
+                    if (*completed) return;
+                    *completed = true;
+                    m_sshHealthInflight.remove(id);
+                    const QString out = QString::fromUtf8(chk->readAllStandardOutput()).trimmed();
+                    chk->deleteLater();
+                    const int idx = indexOfId(id);
+                    if (idx < 0 || !m_runtimes.contains(id) || exitStatus != QProcess::NormalExit || code != 0) return;
+
+                    WorkerRuntime& r = m_runtimes[id];
+                    if (r.userStopped || r.status == WorkerStatus::Stopped || r.status == WorkerStatus::Restarting) {
+                        return;
+                    }
+                    if (out == QStringLiteral("DEAD")) {
+                        detachSshLogTail(id);
+                        const QString deadLabel = (r.pid > 0)
+                            ? QStringLiteral("Remote process PID %1").arg(r.pid)
+                            : QStringLiteral("Remote process");
+                        markWorkerCrashedOrScheduleRestart(m_profiles[idx], r, deadLabel);
+                        Q_EMIT workersChanged();
+                    } else if (out.toLongLong() > 0) {
+                        r.pid = out.toLongLong();
+                        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+                        if (r.startedAtEpochMs > 0 && (now - r.startedAtEpochMs) > 60000 && r.restartAttempts > 0) {
+                            r.restartAttempts = 0;
+                        }
+                    }
+                });
+
+        chk->start(sshBin,
+                   {QStringLiteral("-o"), QStringLiteral("BatchMode=yes"),
+                    QStringLiteral("-o"), QStringLiteral("ConnectTimeout=5"),
+                    QStringLiteral("-p"), portStr,
+                    QStringLiteral("--"),
+                    sshTarget, remoteCmd});
+    }
+}
+
 void WorkerController::onHealthCheckTick()
 {
     ++m_healthTickCounter;
@@ -1329,9 +1758,6 @@ void WorkerController::onHealthCheckTick()
     bool changed = false;
 
     for (const WorkerProfile& p : m_profiles) {
-        if (p.targetType == TargetType::RemoteSsh) {
-            continue;
-        }
         WorkerRuntime& rt = m_runtimes[p.id];
 
         if (rt.status == WorkerStatus::Restarting && rt.nextRetryEpochMs > 0 && now >= rt.nextRetryEpochMs) {
@@ -1341,71 +1767,42 @@ void WorkerController::onHealthCheckTick()
             continue;
         }
 
+        if (p.targetType == TargetType::RemoteSsh) {
+            continue;
+        }
+
         if (rt.pid > 0 && rt.status != WorkerStatus::Stopped) {
             if (ProcessScanner::isPidAlive(rt.pid)) {
+                if (p.targetType == TargetType::PodmanContainer
+                    && rt.wrapperPid > 0
+                    && rt.pid == rt.wrapperPid) {
+                    const qint64 child = ProcessScanner::findChildMinerPid(rt.wrapperPid);
+                    if (child > 0) {
+                        rt.pid = child;
+                        changed = true;
+                    }
+                }
                 if (rt.startedAtEpochMs > 0 && (now - rt.startedAtEpochMs) > 60000 && rt.restartAttempts > 0) {
                     rt.restartAttempts = 0;
                 }
             } else {
                 const qint64 deadPid = rt.pid;
-                rt.pid = 0;
-                rt.wrapperPid = 0;
-                rt.hashrateKhs = 0.0;
-                rt.hashrateDisplay.clear();
-
-                if (!rt.userStopped && p.autoRestart && p.enabled) {
-                    rt.restartAttempts = qMin(rt.restartAttempts + 1, 6);
-                    const qint64 delayMs = qMin<qint64>(30000, 3000 * (1LL << (rt.restartAttempts - 1)));
-                    rt.nextRetryEpochMs = now + delayMs;
-                    rt.status = WorkerStatus::Restarting;
-                    appendSanitizedLines(p.id, rt,
-                                         {QStringLiteral("[KMM] Process PID %1 exited; restarting in %2s (attempt #%3)")
-                                              .arg(deadPid)
-                                              .arg(delayMs / 1000)
-                                              .arg(rt.restartAttempts)});
-                } else {
-                    rt.status = WorkerStatus::Error;
-                    rt.lastError = QStringLiteral("Process exited unexpectedly");
-                }
+                markWorkerCrashedOrScheduleRestart(p, rt, QStringLiteral("Process PID %1").arg(deadPid));
                 changed = true;
             }
         }
     }
 
+    // Periodic Podman netns verification (catches restarted containers cleanly)
+#ifndef Q_OS_WIN
+    if (m_healthTickCounter == 2 || (m_healthTickCounter % 10) == 0) {
+        checkPodmanNamespacesNow();
+    }
+#endif
+
     // Periodic SSH PID verification every 15 seconds
     if ((m_healthTickCounter % 15) == 0) {
-        for (const WorkerProfile& p : m_profiles) {
-            if (p.targetType != TargetType::RemoteSsh) continue;
-            const WorkerRuntime& rt = m_runtimes.value(p.id);
-            if (rt.userStopped || rt.status == WorkerStatus::Stopped || p.sshTarget.trimmed().isEmpty()) continue;
-
-            const QString id = p.id;
-            QProcess* chk = new QProcess(this);
-            const QString portStr = QString::number(p.sshPort > 0 ? p.sshPort : 22);
-            const QString remoteCmd = QStringLiteral(
-                "if [ -f ~/.kristatech-mm/%1.pid ] && kill -0 $(cat ~/.kristatech-mm/%1.pid) 2>/dev/null; then "
-                "cat ~/.kristatech-mm/%1.pid; else echo DEAD; fi").arg(id);
-            connect(chk, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-                    this, [this, chk, id](int code, QProcess::ExitStatus) {
-                        const QString out = QString::fromUtf8(chk->readAllStandardOutput()).trimmed();
-                        chk->deleteLater();
-                        if (!m_runtimes.contains(id) || code != 0) return;
-                        WorkerRuntime& r = m_runtimes[id];
-                        if (out == QStringLiteral("DEAD") && !r.userStopped) {
-                            r.status = WorkerStatus::Error;
-                            r.pid = 0;
-                            r.hashrateKhs = 0.0;
-                            Q_EMIT workersChanged();
-                        } else if (out.toLongLong() > 0) {
-                            r.pid = out.toLongLong();
-                        }
-                    });
-            chk->start(QStringLiteral("ssh"),
-                       {QStringLiteral("-o"), QStringLiteral("BatchMode=yes"),
-                        QStringLiteral("-o"), QStringLiteral("ConnectTimeout=5"),
-                        QStringLiteral("-p"), portStr,
-                        p.sshTarget.trimmed(), remoteCmd});
-        }
+        checkRemoteSshHealthNow();
     }
 
     if (changed) {

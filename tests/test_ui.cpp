@@ -5,19 +5,26 @@
 #include "rpc_client.h"
 #include "theme.h"
 #include "worker_controller.h"
+#include "worker_dialog.h"
 
 #include <QApplication>
 #include <QCheckBox>
+#include <QComboBox>
+#include <QFileDialog>
 #include <QFontMetrics>
+#include <QFormLayout>
 #include <QHeaderView>
 #include <QItemSelectionModel>
 #include <QLayout>
 #include <QLineEdit>
+#include <QListView>
 #include <QPixmap>
 #include <QPushButton>
 #include <QSettings>
+#include <QSpinBox>
 #include <QTableWidget>
 #include <QTemporaryDir>
+#include <QTreeView>
 #include <QtTest>
 
 namespace {
@@ -119,6 +126,8 @@ private Q_SLOTS:
     void testToggleInternalGenButtonBidirectional();
     void testAutoStopDeferredCheckboxAndI18n();
     void testActionButtonsNotClippedWithVerticalScrollbar();
+    void testWorkerDialogCustomRpcAndRemoteSshVisibilityAndValidation();
+    void testFileDialogAndItemViewsThemeContrast();
 
 private:
     QTemporaryDir m_settingsDir;
@@ -130,7 +139,7 @@ void TestUi::initTestCase()
     QSettings::setPath(QSettings::NativeFormat, QSettings::UserScope, m_settingsDir.path());
     qApp->setApplicationName(QStringLiteral("KristaTechMinerManagerTest"));
     qApp->setOrganizationName(QStringLiteral("KristaTechTest"));
-    qApp->setStyleSheet(Theme::buildStylesheet(false));
+    Theme::applyTheme(qApp, false);
 }
 
 void TestUi::testEmptyTableColumnsFitHeaders()
@@ -815,6 +824,243 @@ void TestUi::testActionButtonsNotClippedWithVerticalScrollbar()
 #ifndef Q_OS_WIN
     controller.stopWorker(QStringLiteral("worker_01"));
 #endif
+}
+
+void TestUi::testWorkerDialogCustomRpcAndRemoteSshVisibilityAndValidation()
+{
+    I18n::instance().setLanguage(I18n::Language::EN);
+    RpcClient rpc;
+    WorkerDialog dlg(nullptr, &rpc, {}, {});
+    dlg.show();
+    QApplication::processEvents();
+
+    QComboBox* comboTarget = nullptr;
+    for (QComboBox* cb : dlg.findChildren<QComboBox*>()) {
+        if (cb->findData(static_cast<int>(TargetType::RemoteSsh)) >= 0) {
+            comboTarget = cb;
+            break;
+        }
+    }
+    QVERIFY(comboTarget != nullptr);
+
+    QLineEdit* editName = nullptr;
+    QLineEdit* editBinary = nullptr;
+    QLineEdit* editConf = nullptr;
+    QLineEdit* editRpcUrl = nullptr;
+    QLineEdit* editRpcUser = nullptr;
+    QLineEdit* editRpcPass = nullptr;
+    QLineEdit* editSshTarget = nullptr;
+    QLineEdit* editRemoteBin = nullptr;
+    QSpinBox* spinSshPort = nullptr;
+
+    for (QLineEdit* le : dlg.findChildren<QLineEdit*>()) {
+        const QString ph = le->placeholderText();
+        if (ph.contains(QStringLiteral("worker_gpu_0"))) editName = le;
+        else if (ph == KTr(QStringLiteral("dlg.rpc_user"))) editRpcUser = le;
+        else if (ph == KTr(QStringLiteral("dlg.rpc_pass"))) editRpcPass = le;
+        else if (ph == QStringLiteral("user@server-ip")) editSshTarget = le;
+        else if (ph.contains(QStringLiteral("/usr/local/bin/cpuminer"))) editRemoteBin = le;
+        else if (le->text() == QStringLiteral("http://127.0.0.1:27998/")) editRpcUrl = le;
+        else if (le->text() == ProcessScanner::defaultCpuMinerPath()) editBinary = le;
+        else if (le->text() == ConfigStore::defaultKristaTechConfPath()) editConf = le;
+    }
+    for (QSpinBox* sb : dlg.findChildren<QSpinBox*>()) {
+        if (sb->prefix() == QStringLiteral("Port: ")) {
+            spinSshPort = sb;
+            break;
+        }
+    }
+
+    QVERIFY(editName && editBinary && editConf && editRpcUrl && editRpcUser && editRpcPass
+            && editSshTarget && editRemoteBin && spinSshPort);
+
+    QFormLayout* form = nullptr;
+    for (QFormLayout* fl : dlg.findChildren<QFormLayout*>()) {
+        if (fl->labelForField(editRpcUrl->parentWidget())) {
+            form = fl;
+            break;
+        }
+    }
+    QVERIFY(form != nullptr);
+
+    QWidget* rowBinary = editBinary->parentWidget();
+    QWidget* rowConf = editConf->parentWidget();
+    QWidget* rowRpcUrl = editRpcUrl->parentWidget();
+    QWidget* rowRpcAuth = editRpcUser->parentWidget();
+    QWidget* rowSsh = editSshTarget->parentWidget();
+    QWidget* rowPodman = form->labelForField(rowConf) ? nullptr : nullptr;
+    for (QComboBox* cb : dlg.findChildren<QComboBox*>()) {
+        if (cb->isEditable() && cb->parentWidget() != &dlg && form->labelForField(cb->parentWidget())) {
+            rowPodman = cb->parentWidget();
+            break;
+        }
+    }
+    QVERIFY(rowPodman != nullptr);
+
+    auto assertRowVis = [&](QWidget* row, bool expectedVisible, const char* name) {
+        QWidget* lbl = form->labelForField(row);
+        QVERIFY2(lbl != nullptr, name);
+        QCOMPARE(row->isVisibleTo(&dlg), expectedVisible);
+        QCOMPARE(lbl->isVisibleTo(&dlg), expectedVisible);
+    };
+
+    // 1. LocalWallet
+    comboTarget->setCurrentIndex(comboTarget->findData(static_cast<int>(TargetType::LocalWallet)));
+    QApplication::processEvents();
+    assertRowVis(rowBinary, true, "local:binary");
+    assertRowVis(rowConf, true, "local:conf");
+    assertRowVis(rowPodman, false, "local:podman");
+    assertRowVis(rowRpcUrl, false, "local:rpcUrl");
+    assertRowVis(rowRpcAuth, false, "local:rpcAuth");
+    assertRowVis(rowSsh, false, "local:ssh");
+
+    // 2. PodmanContainer
+    comboTarget->setCurrentIndex(comboTarget->findData(static_cast<int>(TargetType::PodmanContainer)));
+    QApplication::processEvents();
+    assertRowVis(rowBinary, true, "podman:binary");
+    assertRowVis(rowConf, false, "podman:conf");
+    assertRowVis(rowPodman, true, "podman:podman");
+    assertRowVis(rowRpcUrl, false, "podman:rpcUrl");
+    assertRowVis(rowRpcAuth, false, "podman:rpcAuth");
+    assertRowVis(rowSsh, false, "podman:ssh");
+
+    // 3. CustomRpc
+    comboTarget->setCurrentIndex(comboTarget->findData(static_cast<int>(TargetType::CustomRpc)));
+    QApplication::processEvents();
+    assertRowVis(rowBinary, true, "custom:binary");
+    assertRowVis(rowConf, false, "custom:conf");
+    assertRowVis(rowPodman, false, "custom:podman");
+    assertRowVis(rowRpcUrl, true, "custom:rpcUrl");
+    assertRowVis(rowRpcAuth, true, "custom:rpcAuth");
+    assertRowVis(rowSsh, false, "custom:ssh");
+
+    // 4. RemoteSsh (binary row + label MUST both hide)
+    comboTarget->setCurrentIndex(comboTarget->findData(static_cast<int>(TargetType::RemoteSsh)));
+    QApplication::processEvents();
+    assertRowVis(rowBinary, false, "ssh:binary");
+    assertRowVis(rowConf, false, "ssh:conf");
+    assertRowVis(rowPodman, false, "ssh:podman");
+    assertRowVis(rowRpcUrl, true, "ssh:rpcUrl");
+    assertRowVis(rowRpcAuth, true, "ssh:rpcAuth");
+    assertRowVis(rowSsh, true, "ssh:ssh");
+
+    // 5. Validation + normalization on CustomRpc and RemoteSsh
+    QPushButton* btnSave = nullptr;
+    for (QPushButton* b : dlg.findChildren<QPushButton*>()) {
+        if (b->property("variant").toString() == QStringLiteral("primary")) {
+            btnSave = b;
+            break;
+        }
+    }
+    QVERIFY(btnSave != nullptr);
+
+    editName->setText(QStringLiteral("Custom Rig"));
+    comboTarget->setCurrentIndex(comboTarget->findData(static_cast<int>(TargetType::CustomRpc)));
+    editRpcUrl->setText(QStringLiteral("ftp://invalid-url"));
+    editRpcUser->setText(QStringLiteral("u1"));
+    editRpcPass->setText(QStringLiteral("p1"));
+    QTimer::singleShot(50, qApp, []() {
+        if (QWidget* w = QApplication::activeModalWidget()) w->close();
+    });
+    btnSave->click();
+    QApplication::processEvents();
+    QCOMPARE(dlg.result(), 0); // Rejected by validation
+
+    editRpcUrl->setText(QStringLiteral(" 192.168.1.50:27998 "));
+    const WorkerProfile customRes = dlg.resultProfile();
+    QCOMPARE(customRes.rpcUrl, QStringLiteral("http://192.168.1.50:27998/"));
+    QCOMPARE(customRes.rpcUser, QStringLiteral("u1"));
+    QCOMPARE(customRes.rpcPassword, QStringLiteral("p1"));
+
+    comboTarget->setCurrentIndex(comboTarget->findData(static_cast<int>(TargetType::RemoteSsh)));
+    editSshTarget->setText(QStringLiteral("-oProxyCommand=evil"));
+    editRpcUrl->setText(QStringLiteral("127.0.0.1:27998"));
+    editRpcUser->setText(QStringLiteral("u2"));
+    editRpcPass->setText(QStringLiteral("p2"));
+    QTimer::singleShot(50, qApp, []() {
+        if (QWidget* w = QApplication::activeModalWidget()) w->close();
+    });
+    btnSave->click();
+    QApplication::processEvents();
+    QCOMPARE(dlg.result(), 0); // Rejected bad SSH target
+
+    editSshTarget->setText(QStringLiteral("miner@10.0.0.5"));
+    spinSshPort->setValue(2222);
+    editRemoteBin->setText(QStringLiteral("~/bin/cpuminer"));
+    btnSave->click();
+    QApplication::processEvents();
+    QCOMPARE(dlg.result(), static_cast<int>(QDialog::Accepted));
+
+    const WorkerProfile sshRes = dlg.resultProfile();
+    QCOMPARE(sshRes.targetType, TargetType::RemoteSsh);
+    QCOMPARE(sshRes.sshTarget, QStringLiteral("miner@10.0.0.5"));
+    QCOMPARE(sshRes.sshPort, 2222);
+    QCOMPARE(sshRes.remoteBinaryPath, QStringLiteral("~/bin/cpuminer"));
+    QCOMPARE(sshRes.rpcUrl, QStringLiteral("http://127.0.0.1:27998/"));
+    QCOMPARE(sshRes.rpcUser, QStringLiteral("u2"));
+    QCOMPARE(sshRes.rpcPassword, QStringLiteral("p2"));
+}
+
+void TestUi::testFileDialogAndItemViewsThemeContrast()
+{
+    for (const bool isLight : {false, true}) {
+        Theme::applyTheme(qApp, isLight);
+        const QPalette pal = qApp->palette();
+
+        const int baseL = pal.color(QPalette::Base).lightness();
+        const int altBaseL = pal.color(QPalette::AlternateBase).lightness();
+        const int winL = pal.color(QPalette::Window).lightness();
+        const int textL = pal.color(QPalette::Text).lightness();
+        const int winTextL = pal.color(QPalette::WindowText).lightness();
+        const int btnTextL = pal.color(QPalette::ButtonText).lightness();
+        const int hlTextL = pal.color(QPalette::HighlightedText).lightness();
+
+        if (!isLight) {
+            QVERIFY(baseL < 60);
+            QVERIFY(altBaseL < 60);
+            QVERIFY(winL < 60);
+            QVERIFY(textL > 190);
+            QVERIFY(winTextL > 190);
+            QVERIFY(btnTextL > 190);
+            QVERIFY(hlTextL > 190);
+        } else {
+            QVERIFY(baseL > 220);
+            QVERIFY(altBaseL > 220);
+            QVERIFY(winL > 220);
+            QVERIFY(textL < 70);
+            QVERIFY(winTextL < 70);
+            QVERIFY(btnTextL < 70);
+            QVERIFY(hlTextL < 70);
+        }
+
+        const QString qss = Theme::buildStylesheet(isLight);
+        QVERIFY(qss.contains(QStringLiteral("QTreeView")));
+        QVERIFY(qss.contains(QStringLiteral("QListView")));
+        QVERIFY(qss.contains(QStringLiteral("QTableView")));
+        QVERIFY(qss.contains(QStringLiteral("QToolButton")));
+
+        QFileDialog fd;
+        fd.setOption(QFileDialog::DontUseNativeDialog, true);
+        fd.ensurePolished();
+        QApplication::processEvents();
+
+        const auto trees = fd.findChildren<QTreeView*>();
+        const auto lists = fd.findChildren<QListView*>();
+        QVERIFY(!trees.isEmpty());
+        QVERIFY(!lists.isEmpty());
+        for (QTreeView* tv : trees) {
+            const QPalette p = tv->palette();
+            QCOMPARE(p.color(QPalette::Base), pal.color(QPalette::Base));
+            QCOMPARE(p.color(QPalette::Text), pal.color(QPalette::Text));
+        }
+        for (QListView* lv : lists) {
+            const QPalette p = lv->palette();
+            QCOMPARE(p.color(QPalette::Base), pal.color(QPalette::Base));
+            QCOMPARE(p.color(QPalette::Text), pal.color(QPalette::Text));
+        }
+    }
+
+    Theme::applyTheme(qApp, false);
 }
 
 QTEST_MAIN(TestUi)

@@ -5,10 +5,14 @@
 #include "process_scanner.h"
 #include "rpc_client.h"
 
+#include <QByteArray>
 #include <QHash>
 #include <QObject>
+#include <QSet>
 #include <QTimer>
 #include <QVector>
+
+#include <functional>
 
 class QProcess;
 
@@ -62,6 +66,15 @@ public:
     void stopAllManagedAndCleanup();
     void detachAll();
 
+    /** Checks running Podman workers for stale network namespaces and reattaches them asynchronously. */
+    void checkPodmanNamespacesNow();
+
+    /** Checks running Remote SSH workers' PIDs asynchronously. */
+    void checkRemoteSshHealthNow();
+
+    /** Test seam overriding /proc/<pid>/ns/net resolution (defaults to ProcessScanner::readProcessNetNs). */
+    void setNetNsResolverForTest(std::function<QString(qint64)> resolver);
+
     /** Pure log parser helper (unit-tested). */
     static void parseLogLine(const QString& sanitizedLine, WorkerRuntime& rt);
 
@@ -85,6 +98,7 @@ private:
     bool matchesProcess(const WorkerProfile& p, const DiscoveredProcess& dp) const;
     bool isWorkerRunning(const WorkerProfile& p, const WorkerRuntime& rt) const;
     void autoStopIfDeferred(const QString& id);
+    void markWorkerCrashedOrScheduleRestart(const WorkerProfile& p, WorkerRuntime& rt, const QString& deadLabel);
 
     void startLocalOrPodman(const WorkerProfile& p, WorkerRuntime& rt);
     void launchLocalOrPodmanWithPid(const WorkerProfile& p, WorkerRuntime& rt, const QString& exePath, qint64 podPid);
@@ -100,7 +114,12 @@ private:
     QVector<WorkerProfile> m_profiles;
     QHash<QString, WorkerRuntime> m_runtimes;
     QHash<QString, QProcess*> m_sshTailProcs;
+    QHash<QString, QProcess*> m_sshStartProcs;
+    QHash<QString, QByteArray> m_sshTailBuffers;
+    QSet<QString> m_sshHealthInflight;
     QHash<QString, QProcess*> m_podmanStartProcs;
+    QProcess* m_podmanNsCheckProc{nullptr};
+    std::function<QString(qint64)> m_netNsResolver;
     QTimer m_logTimer;
     QTimer m_healthTimer;
     int m_healthTickCounter{0};

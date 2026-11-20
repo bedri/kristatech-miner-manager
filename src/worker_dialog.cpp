@@ -52,6 +52,7 @@ WorkerDialog::WorkerDialog(const WorkerProfile* existingProfile,
     root->setSpacing(12);
 
     QFormLayout* form = new QFormLayout();
+    m_form = form;
     form->setSpacing(10);
     form->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
 
@@ -75,6 +76,7 @@ WorkerDialog::WorkerDialog(const WorkerProfile* existingProfile,
 
     // Binary row
     QWidget* binRow = new QWidget(this);
+    m_rowBinary = binRow;
     QHBoxLayout* binLay = new QHBoxLayout(binRow);
     binLay->setContentsMargins(0, 0, 0, 0);
     binLay->setSpacing(6);
@@ -387,12 +389,22 @@ void WorkerDialog::updateVisibilityForEngineAndTarget()
     const bool isCustom = (tgt == TargetType::CustomRpc);
     const bool isSsh = (tgt == TargetType::RemoteSsh);
 
-    m_rowConf->setVisible(isLocal);
-    m_rowPodman->setVisible(isPod);
-    m_rowRpcUrl->setVisible(isCustom || isSsh);
-    m_rowRpcAuth->setVisible(isCustom || isSsh);
-    m_rowSsh->setVisible(isSsh);
-    m_editBinary->parentWidget()->setVisible(!isSsh);
+    auto setFormRowVisible = [this](QWidget* field, bool visible) {
+        if (!field) return;
+        field->setVisible(visible);
+        if (m_form) {
+            if (QWidget* lbl = m_form->labelForField(field)) {
+                lbl->setVisible(visible);
+            }
+        }
+    };
+
+    setFormRowVisible(m_rowConf, isLocal);
+    setFormRowVisible(m_rowPodman, isPod);
+    setFormRowVisible(m_rowRpcUrl, isCustom || isSsh);
+    setFormRowVisible(m_rowRpcAuth, isCustom || isSsh);
+    setFormRowVisible(m_rowSsh, isSsh);
+    setFormRowVisible(m_rowBinary, !isSsh);
 
     adjustSize();
 }
@@ -434,9 +446,19 @@ void WorkerDialog::onAcceptClicked()
         return;
     }
     const TargetType tgt = static_cast<TargetType>(m_comboTarget->currentData().toInt());
-    if (tgt == TargetType::RemoteSsh && m_editSshTarget->text().trimmed().isEmpty()) {
-        QMessageBox::warning(this, windowTitle(), QStringLiteral("SSH User@Host cannot be empty."));
+    if (tgt == TargetType::RemoteSsh && !isValidSshTarget(m_editSshTarget->text().trimmed())) {
+        QMessageBox::warning(this, windowTitle(), QStringLiteral("Invalid SSH User@Host target."));
         return;
+    }
+    if (tgt == TargetType::CustomRpc || tgt == TargetType::RemoteSsh) {
+        if (normalizeRpcUrl(m_editRpcUrl->text()).isEmpty()) {
+            QMessageBox::warning(this, windowTitle(), QStringLiteral("Invalid RPC URL (expected http:// or https:// host[:port])."));
+            return;
+        }
+        if (m_editRpcUser->text().trimmed().isEmpty() || m_editRpcPass->text().isEmpty()) {
+            QMessageBox::warning(this, windowTitle(), QStringLiteral("RPC Username and RPC Password are required."));
+            return;
+        }
     }
     accept();
 }
@@ -455,11 +477,13 @@ WorkerProfile WorkerDialog::resultProfile() const
 
     p.confPath = m_editConfPath->text().trimmed();
     p.podmanName = m_comboPodman->currentText().trimmed();
-    p.rpcUrl = m_editRpcUrl->text().trimmed();
     if (p.targetType == TargetType::CustomRpc || p.targetType == TargetType::RemoteSsh) {
+        const QString normUrl = normalizeRpcUrl(m_editRpcUrl->text());
+        p.rpcUrl = normUrl.isEmpty() ? m_editRpcUrl->text().trimmed() : normUrl;
         p.rpcUser = m_editRpcUser->text().trimmed();
         p.rpcPassword = m_editRpcPass->text();
     } else {
+        p.rpcUrl = m_editRpcUrl->text().trimmed();
         p.rpcUser.clear();
         p.rpcPassword.clear();
     }

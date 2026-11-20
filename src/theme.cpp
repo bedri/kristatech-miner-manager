@@ -1,5 +1,8 @@
 #include "theme.h"
 
+#include <QApplication>
+#include <QColor>
+#include <QPalette>
 #include <QSize>
 
 namespace Theme {
@@ -59,6 +62,63 @@ ThemeColors colors(bool isLight)
         c.logFg = QStringLiteral("#D8E4F5");
     }
     return c;
+}
+
+QPalette buildPalette(bool isLight)
+{
+    const ThemeColors c = colors(isLight);
+    QPalette pal;
+    const QColor pageBg(c.pageBg);
+    const QColor cardBg(c.cardBg);
+    const QColor innerBg(c.innerBg);
+    const QColor altBg(c.tableAltBg);
+    const QColor textPrimary(c.textPrimary);
+    const QColor textSecondary(c.textSecondary);
+    const QColor btnBg(isLight ? QStringLiteral("#F3F7FC") : QStringLiteral("#1A2640"));
+    const QColor selectBg(c.selectBg);
+    const QColor border(c.border);
+    const QColor subtleBorder(c.subtleBorder);
+    const QColor linkCol(c.slateBlue);
+    const QColor linkVisited(c.slateAccent);
+    const QColor white(QStringLiteral("#FFFFFF"));
+
+    for (const QPalette::ColorGroup grp : {QPalette::Active, QPalette::Inactive, QPalette::Disabled}) {
+        pal.setColor(grp, QPalette::Window, pageBg);
+        pal.setColor(grp, QPalette::WindowText, textPrimary);
+        pal.setColor(grp, QPalette::Base, cardBg);
+        pal.setColor(grp, QPalette::AlternateBase, altBg);
+        pal.setColor(grp, QPalette::Text, textPrimary);
+        pal.setColor(grp, QPalette::PlaceholderText, textSecondary);
+        pal.setColor(grp, QPalette::Button, btnBg);
+        pal.setColor(grp, QPalette::ButtonText, textPrimary);
+        pal.setColor(grp, QPalette::ToolTipBase, cardBg);
+        pal.setColor(grp, QPalette::ToolTipText, textPrimary);
+        pal.setColor(grp, QPalette::Highlight, selectBg);
+        pal.setColor(grp, QPalette::HighlightedText, textPrimary);
+        pal.setColor(grp, QPalette::BrightText, white);
+        pal.setColor(grp, QPalette::Link, linkCol);
+        pal.setColor(grp, QPalette::LinkVisited, linkVisited);
+        pal.setColor(grp, QPalette::Mid, border);
+        pal.setColor(grp, QPalette::Dark, border);
+        pal.setColor(grp, QPalette::Midlight, subtleBorder);
+    }
+
+    pal.setColor(QPalette::Disabled, QPalette::WindowText, textSecondary);
+    pal.setColor(QPalette::Disabled, QPalette::Base, innerBg);
+    pal.setColor(QPalette::Disabled, QPalette::Text, textSecondary);
+    pal.setColor(QPalette::Disabled, QPalette::Button, innerBg);
+    pal.setColor(QPalette::Disabled, QPalette::ButtonText, textSecondary);
+    pal.setColor(QPalette::Disabled, QPalette::HighlightedText, textSecondary);
+    return pal;
+}
+
+void applyTheme(QApplication* app, bool isLight)
+{
+    if (!app) {
+        return;
+    }
+    app->setPalette(buildPalette(isLight));
+    app->setStyleSheet(buildStylesheet(isLight));
 }
 
 QString buildStylesheet(bool isLight)
@@ -126,7 +186,20 @@ QString buildStylesheet(bool isLight)
         "QComboBox { padding-right: 26px; }"
         "QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: top right; width: 22px; border: none; border-left: 1px solid @SUBTLE_BORDER@; background: transparent; }"
         "QComboBox::down-arrow { image: url(@CHEVRON_ICON@); width: 12px; height: 12px; }"
+        "QTreeView, QListView, QTableView { "
+        "  background-color: @CARD_BG@; alternate-background-color: @TABLE_ALT@; color: @TEXT_PRIMARY@; "
+        "  border: 1px solid @BORDER@; selection-background-color: @SELECT_BG@; selection-color: @TEXT_PRIMARY@; outline: none; "
+        "}"
+        "QTreeView::item, QListView::item, QTableView::item { color: @TEXT_PRIMARY@; padding: 3px 6px; }"
+        "QTreeView::item:hover, QListView::item:hover, QTableView::item:hover { background-color: @ROW_HOVER@; color: @TEXT_PRIMARY@; }"
+        "QTreeView::item:selected, QListView::item:selected, QTableView::item:selected { background-color: @SELECT_BG@; color: @TEXT_PRIMARY@; }"
         "QComboBox QAbstractItemView { background-color: @CARD_BG@; color: @TEXT_PRIMARY@; border: 1px solid @BORDER@; selection-background-color: @SELECT_BG@; selection-color: @TEXT_PRIMARY@; outline: none; }"
+        "QToolBar { background-color: @PAGE_BG@; border: none; spacing: 4px; }"
+        "QToolButton { background-color: transparent; color: @TEXT_PRIMARY@; border: 1px solid transparent; border-radius: 5px; padding: 4px; }"
+        "QToolButton:hover { background-color: @BTN_HOVER@; border-color: @SLATE_ACCENT@; }"
+        "QToolButton:pressed { background-color: @BTN_PRESSED@; }"
+        "QToolButton:checked { background-color: @SELECT_BG@; border-color: @SLATE_BLUE@; color: @TEXT_PRIMARY@; }"
+        "QAbstractScrollArea::corner { background-color: @CARD_BG@; }"
         "QCheckBox { spacing: 6px; color: @TEXT_PRIMARY@; }"
         "QCheckBox::indicator { width: 16px; height: 16px; border-radius: 4px; border: 1px solid @BORDER@; background-color: @INNER_BG@; }"
         "QCheckBox::indicator:hover { border-color: @SLATE_ACCENT@; }"

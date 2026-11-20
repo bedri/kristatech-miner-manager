@@ -526,7 +526,7 @@ void MainWindow::setLightTheme(bool isLight)
     settings.setValue(QStringLiteral("ui/lightTheme"), m_isLight);
     {
         QScopedValueRollback<bool> guard(m_autoResizingColumns, true);
-        qApp->setStyleSheet(Theme::buildStylesheet(m_isLight));
+        Theme::applyTheme(qApp, m_isLight);
     }
     m_btnTheme->setText(KTr(m_isLight ? QStringLiteral("btn.theme_light") : QStringLiteral("btn.theme_dark")));
     refreshTableAndKpis();

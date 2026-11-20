@@ -172,6 +172,9 @@ TargetType targetTypeFromString(const QString& str);
 QString statusToKey(WorkerStatus status);
 
 bool isValidWorkerId(const QString& id);
+bool isValidSshTarget(const QString& target);
+QString normalizeRpcUrl(const QString& rawUrl);
+bool isLoopbackRpcUrl(const QString& rawUrl);
 QString sanitizeWorkerId(const QString& raw);
 QString formatHashrateKhs(double khs);
 

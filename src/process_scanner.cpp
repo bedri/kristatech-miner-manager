@@ -12,6 +12,7 @@
 #include <QJsonObject>
 #include <QProcess>
 #include <QRegularExpression>
+#include <QSet>
 #include <QStandardPaths>
 
 #ifdef Q_OS_WIN
@@ -230,6 +231,23 @@ QString resolveProcStdoutPath(qint64 pid)
         return {};
     }
     return target;
+}
+
+QString extractConfigBaseName(const QStringList& args)
+{
+    for (int i = 0; i < args.size(); ++i) {
+        const QString& a = args[i];
+        QString cfg;
+        if (a.startsWith(QStringLiteral("--config="))) {
+            cfg = a.mid(9).trimmed();
+        } else if ((a == QStringLiteral("-c") || a == QStringLiteral("--config")) && i + 1 < args.size()) {
+            cfg = args[i + 1].trimmed();
+        }
+        if (!cfg.isEmpty()) {
+            return QFileInfo(cfg).completeBaseName();
+        }
+    }
+    return {};
 }
 #endif
 
@@ -524,14 +542,23 @@ QVector<DiscoveredProcess> ProcessScanner::scanRunningMiners()
         if (dp.binaryPath.isEmpty() && !h.exePath.isEmpty()) {
             dp.binaryPath = h.exePath;
         }
+        if (dp.targetType == TargetType::LocalWallet && !dp.rpcUrl.isEmpty() && !isLoopbackRpcUrl(dp.rpcUrl)) {
+            dp.targetType = TargetType::CustomRpc;
+        }
         out.append(dp);
     }
     return out;
 #else
-    // 1. Map container PID -> container name
+    // 1. Map container PID -> container name (and keep name/address maps for stale wrapper adoption)
     QHash<qint64, QString> containerPidToName;
+    QSet<QString> knownPodNames;
+    QHash<QString, QString> podAddrToName;
     const QVector<PodmanContainerInfo> pods = discoverPodmanContainers();
     for (const PodmanContainerInfo& pod : pods) {
+        knownPodNames.insert(pod.name);
+        if (!pod.assignedAddress.isEmpty()) {
+            podAddrToName.insert(pod.assignedAddress, pod.name);
+        }
         if (pod.running && pod.pid > 0) {
             containerPidToName.insert(pod.pid, pod.name);
         }
@@ -568,10 +595,12 @@ QVector<DiscoveredProcess> ProcessScanner::scanRunningMiners()
 
     // Map wrapper PID (e.g., podman unshare nsenter -t <podPid> -n ...) -> podName
     QHash<qint64, QString> wrapperPidToPod;
+    QSet<qint64> podmanWrapperPids;
     for (qint64 pid : pids) {
         const RawProc& rp = rawProcs[pid];
         const QString base0 = QFileInfo(rp.args.first()).fileName();
         if (base0 == QStringLiteral("podman") && rp.args.contains(QStringLiteral("nsenter"))) {
+            podmanWrapperPids.insert(pid);
             const int tIdx = rp.args.indexOf(QStringLiteral("-t"));
             if (tIdx >= 0 && tIdx + 1 < rp.args.size()) {
                 const qint64 targetPodPid = rp.args[tIdx + 1].toLongLong();
@@ -609,10 +638,27 @@ QVector<DiscoveredProcess> ProcessScanner::scanRunningMiners()
                 dp.podmanName = wrapperPidToPod.value(curPpid);
                 break;
             }
+            if (podmanWrapperPids.contains(curPpid)) {
+                dp.wrapperPid = curPpid;
+                dp.targetType = TargetType::PodmanContainer;
+                if (!dp.coinbaseAddress.isEmpty() && podAddrToName.contains(dp.coinbaseAddress)) {
+                    dp.podmanName = podAddrToName.value(dp.coinbaseAddress);
+                } else {
+                    const QString cfgBase = extractConfigBaseName(rp.args);
+                    if (!cfgBase.isEmpty() && knownPodNames.contains(cfgBase)) {
+                        dp.podmanName = cfgBase;
+                    }
+                }
+                break;
+            }
             if (!rawProcs.contains(curPpid)) {
                 break;
             }
             curPpid = rawProcs[curPpid].ppid;
+        }
+
+        if (dp.targetType == TargetType::LocalWallet && !dp.rpcUrl.isEmpty() && !isLoopbackRpcUrl(dp.rpcUrl)) {
+            dp.targetType = TargetType::CustomRpc;
         }
 
         // Heuristic fallback for legacy logs (~/.kristatech/cpuminer_logs/worker_*_<pod|local>.log)
@@ -696,6 +742,26 @@ qint64 ProcessScanner::findChildMinerPid(qint64 parentPid)
         }
     }
     return 0;
+#endif
+}
+
+QString ProcessScanner::readProcessNetNs(qint64 pid)
+{
+#ifdef Q_OS_WIN
+    Q_UNUSED(pid);
+    return {};
+#else
+    if (pid <= 1) {
+        return {};
+    }
+    const QByteArray linkPath = QByteArrayLiteral("/proc/") + QByteArray::number(pid) + QByteArrayLiteral("/ns/net");
+    char buf[256];
+    const ssize_t n = ::readlink(linkPath.constData(), buf, sizeof(buf) - 1);
+    if (n <= 0 || n >= static_cast<ssize_t>(sizeof(buf))) {
+        return {};
+    }
+    buf[n] = '\0';
+    return QString::fromUtf8(buf, static_cast<int>(n)).trimmed();
 #endif
 }
 

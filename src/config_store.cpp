@@ -314,10 +314,15 @@ RpcCredentials ConfigStore::resolveCredentials(const WorkerProfile& profile)
     }
 
     RpcCredentials creds;
-    creds.url = profile.rpcUrl.trimmed();
+    const QString normUrl = normalizeRpcUrl(profile.rpcUrl);
+    if (normUrl.isEmpty()) {
+        creds.error = QStringLiteral("Invalid RPC URL (expected http:// or https:// host[:port])");
+        return creds;
+    }
+    creds.url = normUrl;
     creds.user = profile.rpcUser;
     creds.password = profile.rpcPassword;
-    creds.valid = !creds.url.isEmpty() && !creds.user.isEmpty() && !creds.password.isEmpty();
+    creds.valid = !creds.user.isEmpty() && !creds.password.isEmpty();
     if (!creds.valid) {
         creds.error = QStringLiteral("RPC URL, user, and password are required");
     }

@@ -37,6 +37,9 @@ public:
     /** Finds child PID of wrapper (e.g., podman unshare nsenter -> cpuminer). */
     static qint64 findChildMinerPid(qint64 parentPid);
 
+    /** Reads /proc/<pid>/ns/net symlink target (e.g. "net:[4026535289]") on Linux; empty on Windows or error. */
+    static QString readProcessNetNs(qint64 pid);
+
     /** Queries nvidia-smi asynchronously for CUDA GPU telemetry. */
     void queryNvidiaGpusAsync(std::function<void(const QVector<GpuTelemetry>& gpus)> cb);
 };

@@ -1,7 +1,10 @@
 #pragma once
 
 #include <QIcon>
+#include <QPalette>
 #include <QString>
+
+class QApplication;
 
 /**
  * KristaTech Light/Dark visual theme colors and Qt stylesheet generator.
@@ -36,7 +39,9 @@ struct ThemeColors {
 namespace Theme {
 
 ThemeColors colors(bool isLight);
+QPalette buildPalette(bool isLight);
 QString buildStylesheet(bool isLight);
+void applyTheme(QApplication* app, bool isLight);
 QIcon appIcon();
 
 } // namespace Theme

@@ -1,6 +1,7 @@
 #include "models.h"
 
 #include <QRegularExpression>
+#include <QUrl>
 
 QString engineToString(MinerEngine engine)
 {
@@ -61,6 +62,58 @@ bool isValidWorkerId(const QString& id)
 {
     static const QRegularExpression re(QStringLiteral("^[a-zA-Z0-9_-]{1,64}$"));
     return re.match(id).hasMatch();
+}
+
+bool isValidSshTarget(const QString& target)
+{
+    const QString t = target.trimmed();
+    if (t.isEmpty() || t.startsWith(QLatin1Char('-'))) {
+        return false;
+    }
+    static const QRegularExpression re(
+        QStringLiteral("^(?:[a-zA-Z0-9._%+-]+@)?[a-zA-Z0-9\\[][a-zA-Z0-9._:\\[\\]-]{0,254}$"));
+    return re.match(t).hasMatch();
+}
+
+QString normalizeRpcUrl(const QString& rawUrl)
+{
+    QString s = rawUrl.trimmed();
+    if (s.isEmpty()) {
+        return {};
+    }
+    for (const QChar ch : s) {
+        if (ch.isSpace() || ch.unicode() < 32) {
+            return {};
+        }
+    }
+    if (!s.contains(QStringLiteral("://"))) {
+        s.prepend(QStringLiteral("http://"));
+    }
+    const QUrl u(s, QUrl::StrictMode);
+    const QString scheme = u.scheme().toLower();
+    if (!u.isValid() || (scheme != QStringLiteral("http") && scheme != QStringLiteral("https")) || u.host().isEmpty()) {
+        return {};
+    }
+    QUrl norm = u;
+    norm.setScheme(scheme);
+    norm.setHost(u.host().toLower());
+    if (norm.path().isEmpty()) {
+        norm.setPath(QStringLiteral("/"));
+    }
+    return norm.toString();
+}
+
+bool isLoopbackRpcUrl(const QString& rawUrl)
+{
+    const QString norm = normalizeRpcUrl(rawUrl);
+    if (norm.isEmpty()) {
+        return false;
+    }
+    const QString host = QUrl(norm).host().toLower();
+    return host == QStringLiteral("127.0.0.1")
+        || host == QStringLiteral("localhost")
+        || host == QStringLiteral("::1")
+        || host == QStringLiteral("0.0.0.0");
 }
 
 QString sanitizeWorkerId(const QString& raw)

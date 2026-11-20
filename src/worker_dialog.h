@@ -8,6 +8,7 @@
 class QCheckBox;
 class QComboBox;
 class QDoubleSpinBox;
+class QFormLayout;
 class QFrame;
 class QLabel;
 class QLineEdit;
@@ -58,6 +59,8 @@ private:
     QLineEdit* m_editName{nullptr};
     QLineEdit* m_editId{nullptr};
     QComboBox* m_comboEngine{nullptr};
+    QFormLayout* m_form{nullptr};
+    QWidget* m_rowBinary{nullptr};
     QLineEdit* m_editBinary{nullptr};
     QPushButton* m_btnBrowseBin{nullptr};
     QPushButton* m_btnTestBin{nullptr};

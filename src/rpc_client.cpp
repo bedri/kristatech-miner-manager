@@ -7,7 +7,10 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QProcess>
+#include <QStandardPaths>
 #include <QUrl>
+
+#include <memory>
 
 namespace {
 
@@ -133,7 +136,7 @@ void RpcClient::refreshTargets(const QVector<WorkerProfile>& profiles)
                       st.poolSize = m_poolSeats.size();
                       setTargetStatus(tkey, st);
 
-                      if (p.targetType != TargetType::RemoteSsh) {
+                      if (p.targetType != TargetType::RemoteSsh || m_poolSeats.isEmpty()) {
                           fetchPoolIfNeeded(p, creds, st.blockHeight);
                       }
                   });
@@ -216,8 +219,10 @@ void RpcClient::probeLocalSeatOwnership(const WorkerProfile& profile, const RpcC
 
 void RpcClient::refreshPoolAddressesFromTarget(const WorkerProfile& profile)
 {
-    const RpcCredentials creds = ConfigStore::resolveCredentials(profile);
-    if (!creds.valid && profile.targetType != TargetType::PodmanContainer) {
+    const RpcCredentials creds = (profile.targetType == TargetType::PodmanContainer || profile.targetType == TargetType::RemoteSsh)
+        ? RpcCredentials{}
+        : ConfigStore::resolveCredentials(profile);
+    if (!creds.valid && profile.targetType != TargetType::PodmanContainer && profile.targetType != TargetType::RemoteSsh) {
         return;
     }
     fetchPoolIfNeeded(profile, creds, qMax<qint64>(0, m_lastPoolHeight));
@@ -320,6 +325,11 @@ void RpcClient::invokeRpc(const WorkerProfile& profile,
     }
 
     if (profile.targetType == TargetType::RemoteSsh) {
+        const QString sshTarget = profile.sshTarget.trimmed();
+        if (!isValidSshTarget(sshTarget)) {
+            if (cb) cb(false, QJsonValue(), QStringLiteral("Invalid SSH target"));
+            return;
+        }
         QStringList remoteCmd{QStringLiteral("kristatech-cli"), method};
         for (const QJsonValue& pv : params) {
             if (pv.isBool()) remoteCmd.append(pv.toBool() ? QStringLiteral("true") : QStringLiteral("false"));
@@ -330,7 +340,8 @@ void RpcClient::invokeRpc(const WorkerProfile& profile,
             QStringLiteral("-o"), QStringLiteral("BatchMode=yes"),
             QStringLiteral("-o"), QStringLiteral("ConnectTimeout=6"),
             QStringLiteral("-p"), QString::number(profile.sshPort > 0 ? profile.sshPort : 22),
-            profile.sshTarget.trimmed(),
+            QStringLiteral("--"),
+            sshTarget,
             remoteCmd.join(QLatin1Char(' '))
         };
         invokeCliProcess(QStringLiteral("ssh"), args, cb);
@@ -382,30 +393,61 @@ void RpcClient::invokeHttpJsonRpc(const RpcCredentials& creds,
         }
         const QJsonObject obj = doc.object();
         const QJsonValue errVal = obj.value(QStringLiteral("error"));
-        if (!errVal.isNull() && errVal.isObject()) {
-            const QString msg = errVal.toObject().value(QStringLiteral("message")).toString();
+        if (!errVal.isNull() && !errVal.isUndefined()) {
+            const QString msg = errVal.isObject()
+                ? errVal.toObject().value(QStringLiteral("message")).toString()
+                : errVal.toVariant().toString();
             if (cb) cb(false, QJsonValue(), msg.isEmpty() ? QStringLiteral("RPC error") : msg);
             return;
         }
-        if (cb) cb(true, obj.value(QStringLiteral("result")), QString());
+        const QJsonValue resVal = obj.value(QStringLiteral("result"));
+        if (netErr != QNetworkReply::NoError && (resVal.isNull() || resVal.isUndefined())) {
+            if (cb) cb(false, QJsonValue(), errStr);
+            return;
+        }
+        if (cb) cb(true, resVal, QString());
     });
 }
 
 void RpcClient::invokeCliProcess(const QString& program, const QStringList& args, RpcCallback cb)
 {
+    QString exe = QStandardPaths::findExecutable(program);
+    if (exe.isEmpty()) {
+        exe = program;
+    }
     QProcess* proc = new QProcess(this);
+    auto completed = std::make_shared<bool>(false);
+
+    connect(proc, &QProcess::errorOccurred, this, [proc, program, cb, completed](QProcess::ProcessError err) {
+        if (err != QProcess::FailedToStart || *completed) {
+            return;
+        }
+        *completed = true;
+        const QString msg = QStringLiteral("Failed to start %1: %2").arg(program, proc->errorString());
+        proc->deleteLater();
+        if (cb) cb(false, QJsonValue(), msg);
+    });
+
     connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, [proc, cb](int exitCode, QProcess::ExitStatus) {
+            this, [proc, cb, completed](int exitCode, QProcess::ExitStatus exitStatus) {
+                if (*completed) {
+                    return;
+                }
+                *completed = true;
                 const QByteArray out = proc->readAllStandardOutput();
                 const QByteArray err = proc->readAllStandardError();
                 proc->deleteLater();
-                if (exitCode != 0) {
-                    if (cb) cb(false, QJsonValue(), QString::fromUtf8(err).trimmed());
+                if (exitStatus != QProcess::NormalExit || exitCode != 0) {
+                    const QString errMsg = QString::fromUtf8(err).trimmed();
+                    const QString outMsg = QString::fromUtf8(out).trimmed();
+                    const QString detail = !errMsg.isEmpty() ? errMsg
+                        : (!outMsg.isEmpty() ? outMsg : QStringLiteral("Exit code %1").arg(exitCode));
+                    if (cb) cb(false, QJsonValue(), detail);
                     return;
                 }
                 QJsonValue val;
                 parseCliJsonOutput(out, val);
                 if (cb) cb(true, val, QString());
             });
-    proc->start(program, args);
+    proc->start(exe, args);
 }

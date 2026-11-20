@@ -27,7 +27,7 @@ int main(int argc, char* argv[])
     QSettings settings(QStringLiteral("KristaTech"), QStringLiteral("MinerManager"));
     const bool isLight = settings.value(QStringLiteral("ui/lightTheme"), false).toBool();
     const bool autoStopDeferred = settings.value(QStringLiteral("behavior/autoStopDeferred"), false).toBool();
-    app.setStyleSheet(Theme::buildStylesheet(isLight));
+    Theme::applyTheme(&app, isLight);
 
     const QString smokeDir = QDir(QDir::tempPath()).filePath(
         QStringLiteral("kmm_smoke_%1").arg(QCoreApplication::applicationPid()));
