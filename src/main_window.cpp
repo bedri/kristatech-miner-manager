@@ -544,6 +544,11 @@ void MainWindow::showEvent(QShowEvent* event)
         m_shownTimer.start();
         fitTableColumnsToContents(/*allowShrink=*/true);
         ensureWindowFitsTable();
+        QTimer::singleShot(100, this, [this]() {
+            if (!isVisible() || m_userResizedWindow) return;
+            fitTableColumnsToContents(/*allowShrink=*/true);
+            ensureWindowFitsTable();
+        });
     }
 }
 
@@ -562,6 +567,9 @@ void MainWindow::ensureWindowFitsTable()
 {
     if (!m_table || m_userResizedWindow || isMaximized() || isFullScreen()) {
         return;
+    }
+    if (centralWidget() && centralWidget()->layout()) {
+        centralWidget()->layout()->activate();
     }
     int totalColsWidth = 0;
     for (int c = 0; c < m_table->columnCount(); ++c) {
@@ -753,8 +761,8 @@ void MainWindow::rebuildTable()
     const int startW = qMax(btnFm.horizontalAdvance(startTxt), btnFm.boundingRect(startTxt).width());
     const int stopW = qMax(btnFm.horizontalAdvance(stopTxt), btnFm.boundingRect(stopTxt).width());
     const int editW = qMax(btnFm.horizontalAdvance(editTxt), btnFm.boundingRect(editTxt).width());
-    const int toggleBtnW = qMax(startW, stopW) + 24; // 20px QSS padding + 2px border + 2px cushion
-    const int editBtnW = editW + 24;
+    const int toggleBtnW = qMax(startW, stopW) + 28; // 20px QSS padding + 2px border + cushion
+    const int editBtnW = editW + 28;
 
     for (int r = 0; r < profiles.size(); ++r) {
         const WorkerProfile& p = profiles[r];
@@ -890,7 +898,8 @@ void MainWindow::rebuildTable()
         QPushButton* bToggle = new QPushButton(isRunning ? stopTxt : startTxt, actBox);
         bToggle->setProperty("variant", isRunning ? QStringLiteral("danger") : QStringLiteral("primary"));
         bToggle->setProperty("compact", QStringLiteral("true"));
-        bToggle->setFixedSize(toggleBtnW, 26);
+        bToggle->ensurePolished();
+        bToggle->setFixedSize(qMax(toggleBtnW, bToggle->sizeHint().width()), 26);
         bToggle->setFocusPolicy(Qt::NoFocus);
         connect(bToggle, &QPushButton::clicked, this, [this, id, isRunning]() {
             if (isRunning) m_controller->stopWorker(id);
@@ -900,13 +909,14 @@ void MainWindow::rebuildTable()
         QPushButton* bRestart = new QPushButton(QStringLiteral("↻"), actBox);
         bRestart->setToolTip(KTr(QStringLiteral("act.restart")));
         bRestart->setProperty("compact", QStringLiteral("icon"));
-        bRestart->setFixedSize(26, 26);
+        bRestart->setFixedSize(28, 26);
         bRestart->setFocusPolicy(Qt::NoFocus);
         connect(bRestart, &QPushButton::clicked, this, [this, id]() { m_controller->restartWorker(id); });
 
         QPushButton* bEdit = new QPushButton(editTxt, actBox);
         bEdit->setProperty("compact", QStringLiteral("true"));
-        bEdit->setFixedSize(editBtnW, 26);
+        bEdit->ensurePolished();
+        bEdit->setFixedSize(qMax(editBtnW, bEdit->sizeHint().width()), 26);
         bEdit->setFocusPolicy(Qt::NoFocus);
         connect(bEdit, &QPushButton::clicked, this, [this, id]() { onEditWorker(id); });
 
@@ -914,7 +924,7 @@ void MainWindow::rebuildTable()
         bDel->setToolTip(KTr(QStringLiteral("act.delete")));
         bDel->setProperty("compact", QStringLiteral("icon"));
         bDel->setProperty("role", QStringLiteral("deleteIcon"));
-        bDel->setFixedSize(26, 26);
+        bDel->setFixedSize(28, 26);
         bDel->setFocusPolicy(Qt::NoFocus);
         connect(bDel, &QPushButton::clicked, this, [this, id]() { onDeleteWorker(id); });
 
