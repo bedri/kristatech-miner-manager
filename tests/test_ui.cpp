@@ -131,6 +131,7 @@ private Q_SLOTS:
     void testWorkerDialogCustomRpcAndRemoteSshVisibilityAndValidation();
     void testFileDialogAndItemViewsThemeContrast();
     void testFairnessWalletLockAndSeatExpiryUi();
+    void testSecurityWarningsAndImportGuard();
 
 private:
     QTemporaryDir m_settingsDir;
@@ -1209,6 +1210,77 @@ void TestUi::testFairnessWalletLockAndSeatExpiryUi()
     QFrame* dlgWarn = dlg.findChild<QFrame*>(QStringLiteral("warningBanner"));
     QVERIFY(dlgWarn != nullptr);
     QVERIFY(dlgWarn->isVisibleTo(&dlg));
+}
+
+void TestUi::testSecurityWarningsAndImportGuard()
+{
+    I18n::instance().setLanguage(I18n::Language::EN);
+    RpcClient rpc;
+    WorkerDialog dlg(nullptr, &rpc, {}, {});
+    dlg.show();
+    QApplication::processEvents();
+
+    QComboBox* comboTarget = nullptr;
+    QComboBox* comboPodman = nullptr;
+    for (QComboBox* cb : dlg.findChildren<QComboBox*>()) {
+        if (cb->findData(static_cast<int>(TargetType::RemoteSsh)) >= 0) {
+            comboTarget = cb;
+        } else if (!comboPodman && cb->isEditable() && cb->parentWidget() != &dlg) {
+            comboPodman = cb;
+        }
+    }
+    QVERIFY(comboTarget != nullptr);
+    QVERIFY(comboPodman != nullptr);
+
+    QLineEdit* editName = nullptr;
+    QLineEdit* editRpcUrl = nullptr;
+    for (QLineEdit* le : dlg.findChildren<QLineEdit*>()) {
+        if (le->placeholderText().contains(QStringLiteral("worker_gpu_0"))) editName = le;
+        else if (le->text() == QStringLiteral("http://127.0.0.1:27998/")) editRpcUrl = le;
+    }
+    QVERIFY(editName != nullptr);
+    QVERIFY(editRpcUrl != nullptr);
+
+    QPushButton* btnSave = nullptr;
+    for (QPushButton* b : dlg.findChildren<QPushButton*>()) {
+        if (b->property("variant").toString() == QStringLiteral("primary")) {
+            btnSave = b;
+            break;
+        }
+    }
+    QVERIFY(btnSave != nullptr);
+
+    // 1. Invalid Podman container name ("--privileged") is rejected on Save
+    editName->setText(QStringLiteral("Bad Podman"));
+    comboTarget->setCurrentIndex(comboTarget->findData(static_cast<int>(TargetType::PodmanContainer)));
+    comboPodman->setEditText(QStringLiteral("--privileged"));
+    QTimer::singleShot(50, qApp, []() {
+        if (QWidget* w = QApplication::activeModalWidget()) w->close();
+    });
+    btnSave->click();
+    QApplication::processEvents();
+    QCOMPARE(dlg.result(), 0);
+
+    // 2. Unencrypted non-loopback http:// CustomRpc displays inline warning banner
+    QFrame* warnFrame = dlg.findChild<QFrame*>(QStringLiteral("warningBanner"));
+    QLabel* warnLabel = dlg.findChild<QLabel*>(QStringLiteral("warnLabel"));
+    QVERIFY(warnFrame != nullptr);
+    QVERIFY(warnLabel != nullptr);
+
+    comboTarget->setCurrentIndex(comboTarget->findData(static_cast<int>(TargetType::CustomRpc)));
+    editRpcUrl->setText(QStringLiteral("http://198.51.100.10:27998/"));
+    QApplication::processEvents();
+    QVERIFY(warnFrame->isVisibleTo(&dlg));
+    QVERIFY(warnLabel->text().contains(QStringLiteral("http://")));
+
+    // 3. Switching to HTTPS or loopback HTTP clears the insecure HTTP warning
+    editRpcUrl->setText(QStringLiteral("https://198.51.100.10:27998/"));
+    QApplication::processEvents();
+    QVERIFY(!warnFrame->isVisibleTo(&dlg));
+
+    editRpcUrl->setText(QStringLiteral("http://127.0.0.1:27998/"));
+    QApplication::processEvents();
+    QVERIFY(!warnFrame->isVisibleTo(&dlg));
 }
 
 QTEST_MAIN(TestUi)

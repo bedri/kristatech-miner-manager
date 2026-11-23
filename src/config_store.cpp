@@ -6,16 +6,78 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QProcess>
+#include <QRandomGenerator>
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QStandardPaths>
 
-#ifndef Q_OS_WIN
+#ifdef Q_OS_WIN
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <aclapi.h>
+#include <string>
+#include <vector>
+#else
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
+
+#ifdef Q_OS_WIN
+namespace {
+
+bool applyWindowsOwnerOnlyDacl(const QString& path, bool isDirectory)
+{
+    HANDLE hToken = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        return false;
+    }
+    DWORD needed = 0;
+    GetTokenInformation(hToken, TokenUser, nullptr, 0, &needed);
+    if (needed == 0) {
+        CloseHandle(hToken);
+        return false;
+    }
+    std::vector<BYTE> buf(needed);
+    if (!GetTokenInformation(hToken, TokenUser, buf.data(), needed, &needed)) {
+        CloseHandle(hToken);
+        return false;
+    }
+    CloseHandle(hToken);
+
+    PTOKEN_USER pUser = reinterpret_cast<PTOKEN_USER>(buf.data());
+    EXPLICIT_ACCESSW ea{};
+    ea.grfAccessPermissions = GENERIC_ALL;
+    ea.grfAccessMode = SET_ACCESS;
+    ea.grfInheritance = isDirectory ? (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) : NO_INHERITANCE;
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea.Trustee.TrusteeType = TRUSTEE_IS_USER;
+    ea.Trustee.ptstrName = reinterpret_cast<LPWSTR>(pUser->User.Sid);
+
+    PACL pAcl = nullptr;
+    if (SetEntriesInAclW(1, &ea, nullptr, &pAcl) != ERROR_SUCCESS) {
+        return false;
+    }
+    const std::wstring wPath = QDir::toNativeSeparators(path).toStdWString();
+    const DWORD res = SetNamedSecurityInfoW(
+        const_cast<LPWSTR>(wPath.c_str()),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+        nullptr,
+        nullptr,
+        pAcl,
+        nullptr);
+    if (pAcl) {
+        LocalFree(pAcl);
+    }
+    return res == ERROR_SUCCESS;
+}
+
+} // namespace
 #endif
 
 ConfigStore::ConfigStore(const QString& baseDir)
@@ -62,13 +124,31 @@ QString ConfigStore::defaultLogPath(const QString& workerId) const
 bool ConfigStore::ensureDirectories() const
 {
     auto ensureDir0700 = [](const QString& dirPath) -> bool {
+#ifdef Q_OS_WIN
         QDir d;
         if (!d.exists(dirPath) && !d.mkpath(dirPath)) {
             return false;
         }
         QFile::setPermissions(dirPath,
                               QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+        applyWindowsOwnerOnlyDacl(dirPath, true);
         return true;
+#else
+        const QFileInfo fi(dirPath);
+        const QString parentPath = fi.dir().absolutePath();
+        if (!parentPath.isEmpty() && !QDir().exists(parentPath) && !QDir().mkpath(parentPath)) {
+            return false;
+        }
+        const QByteArray local = dirPath.toLocal8Bit();
+        if (::mkdir(local.constData(), S_IRWXU) != 0 && errno != EEXIST) {
+            return false;
+        }
+        struct stat st{};
+        if (::lstat(local.constData(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+            return false;
+        }
+        return ::chmod(local.constData(), S_IRWXU) == 0;
+#endif
     };
 
     return ensureDir0700(m_baseDir) && ensureDir0700(runtimeDirPath()) && ensureDir0700(logsDirPath());
@@ -99,11 +179,21 @@ bool ConfigStore::writeFile0600(const QString& path, const QByteArray& content, 
         return false;
     }
     QFile::setPermissions(path, QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    applyWindowsOwnerOnlyDacl(path, false);
     return true;
 #else
-    const QString tmpPath = path + QStringLiteral(".tmp.%1").arg(static_cast<qint64>(::getpid()));
-    const QByteArray tmpLocal = tmpPath.toLocal8Bit();
-    int fd = ::open(tmpLocal.constData(), O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    int fd = -1;
+    QString tmpPath;
+    QByteArray tmpLocal;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const quint64 rnd = QRandomGenerator::global()->generate64();
+        tmpPath = path + QStringLiteral(".tmp.%1.%2").arg(static_cast<qint64>(::getpid())).arg(rnd, 16, 16, QLatin1Char('0'));
+        tmpLocal = tmpPath.toLocal8Bit();
+        fd = ::open(tmpLocal.constData(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, S_IRUSR | S_IWUSR);
+        if (fd >= 0 || errno != EEXIST) {
+            break;
+        }
+    }
     if (fd < 0) {
         if (errorOut) *errorOut = QString::fromLocal8Bit(std::strerror(errno));
         return false;
@@ -226,6 +316,75 @@ QVector<WorkerProfile> ConfigStore::parseImportedProfilesJson(const QByteArray& 
     return out;
 }
 
+ImportSecurityReport ConfigStore::inspectImportedProfiles(const QVector<WorkerProfile>& profiles)
+{
+    ImportSecurityReport rep;
+    const QString defConf = QFileInfo(defaultKristaTechConfPath()).absoluteFilePath();
+
+    for (const WorkerProfile& p : profiles) {
+        const QString label = p.name.trimmed().isEmpty() ? p.id : p.name.trimmed();
+        const QString bin = p.binaryPath.trimmed();
+        if (!bin.isEmpty() && (!isExpectedMinerBinaryPath(bin) || bin.contains(QStringLiteral("..")))) {
+            ++rep.customBinaryCount;
+            rep.flaggedDetails.append(QStringLiteral("• %1: custom binaryPath (%2)").arg(label, bin));
+        }
+        if (p.targetType == TargetType::RemoteSsh) {
+            ++rep.sshCount;
+            const QString rbin = p.remoteBinaryPath.trimmed();
+            if (!rbin.isEmpty() && (!isExpectedMinerBinaryPath(rbin) || rbin.contains(QStringLiteral("..")))) {
+                ++rep.customBinaryCount;
+                rep.flaggedDetails.append(QStringLiteral("• %1: custom remoteBinaryPath (%2)").arg(label, rbin));
+            } else {
+                rep.flaggedDetails.append(QStringLiteral("• %1: Remote SSH target (%2)").arg(label, p.sshTarget));
+            }
+        }
+        if (!p.extraArgs.trimmed().isEmpty()) {
+            ++rep.extraArgsCount;
+            rep.flaggedDetails.append(QStringLiteral("• %1: extraArgs (%2)").arg(label, p.extraArgs.trimmed()));
+        }
+        if (p.targetType == TargetType::LocalWallet && !p.confPath.trimmed().isEmpty()) {
+            const QString candConf = QFileInfo(p.confPath.trimmed()).absoluteFilePath();
+            if (candConf != defConf) {
+                ++rep.customConfCount;
+                rep.flaggedDetails.append(QStringLiteral("• %1: non-default confPath (%2)").arg(label, p.confPath.trimmed()));
+            }
+        }
+        if (p.targetType == TargetType::CustomRpc) {
+            const QString norm = normalizeRpcUrl(p.rpcUrl);
+            if (norm.startsWith(QStringLiteral("http://"), Qt::CaseInsensitive) && !isLoopbackRpcUrl(norm)) {
+                ++rep.plaintextRemoteHttpCount;
+                rep.flaggedDetails.append(QStringLiteral("• %1: unencrypted http:// RPC (%2)").arg(label, norm));
+            }
+        }
+    }
+    return rep;
+}
+
+void ConfigStore::sanitizeImportedProfiles(QVector<WorkerProfile>& profiles)
+{
+    const QString defConf = defaultKristaTechConfPath();
+    for (WorkerProfile& p : profiles) {
+        const QString bin = p.binaryPath.trimmed();
+        if (!bin.isEmpty() && (!isExpectedMinerBinaryPath(bin) || bin.contains(QStringLiteral("..")))) {
+            p.binaryPath.clear();
+        }
+        const QString rbin = p.remoteBinaryPath.trimmed();
+        if (!rbin.isEmpty() && (!isExpectedMinerBinaryPath(rbin) || rbin.contains(QStringLiteral("..")))) {
+            p.remoteBinaryPath.clear();
+        }
+        p.extraArgs.clear();
+        if (p.targetType == TargetType::LocalWallet) {
+            p.confPath = defConf;
+        }
+        if (p.targetType == TargetType::PodmanContainer && !isValidPodmanName(p.podmanName)) {
+            p.podmanName.clear();
+        }
+        if (p.targetType == TargetType::RemoteSsh && !isValidSshTarget(p.sshTarget)) {
+            p.sshTarget.clear();
+        }
+    }
+}
+
 RpcCredentials ConfigStore::parseKristaTechConf(const QString& confContent, int defaultPort)
 {
     RpcCredentials creds;
@@ -239,7 +398,7 @@ RpcCredentials ConfigStore::parseKristaTechConf(const QString& confContent, int 
         if (line.isEmpty() || line.startsWith(QLatin1Char('#'))) {
             continue;
         }
-        const int eqIdx = line.indexOf(QLatin1Char('='));
+        const int eqIdx = static_cast<int>(line.indexOf(QLatin1Char('=')));
         if (eqIdx <= 0) {
             continue;
         }
@@ -289,9 +448,12 @@ RpcCredentials ConfigStore::resolveCredentials(const WorkerProfile& profile)
     }
 
     if (profile.targetType == TargetType::PodmanContainer) {
-        if (profile.podmanName.trimmed().isEmpty()) {
+        const QString podName = profile.podmanName.trimmed();
+        if (podName.isEmpty() || !isValidPodmanName(podName)) {
             RpcCredentials bad;
-            bad.error = QStringLiteral("Podman container name is empty");
+            bad.error = podName.isEmpty()
+                ? QStringLiteral("Podman container name is empty")
+                : QStringLiteral("Invalid Podman container name");
             return bad;
         }
         const QString podmanBin = QStandardPaths::findExecutable(QStringLiteral("podman"));
@@ -302,7 +464,7 @@ RpcCredentials ConfigStore::resolveCredentials(const WorkerProfile& profile)
         }
         QProcess proc;
         proc.start(podmanBin,
-                   {QStringLiteral("exec"), profile.podmanName.trimmed(),
+                   {QStringLiteral("exec"), podName,
                     QStringLiteral("cat"), QStringLiteral("/data/kristatech.conf")});
         if (!proc.waitForFinished(5000) || proc.exitCode() != 0) {
             RpcCredentials bad;
@@ -388,6 +550,22 @@ QString ConfigStore::sanitizeLogLine(const QString& rawLine)
     // Mask --rpcpassword=... / --rpcuser=...
     static const QRegularExpression reRpcFlag(QStringLiteral("(--rpc(?:password|user)(?:=|\\s+))([^\\s'\"]+)"));
     line.replace(reRpcFlag, QStringLiteral("\\1***"));
+
+    // Mask HTTP Authorization: Basic / Bearer headers
+    static const QRegularExpression reAuthBasic(
+        QStringLiteral("(Authorization:\\s*Basic\\s+)[A-Za-z0-9+/=]+"),
+        QRegularExpression::CaseInsensitiveOption);
+    line.replace(reAuthBasic, QStringLiteral("\\1***"));
+
+    static const QRegularExpression reAuthBearer(
+        QStringLiteral("(Authorization:\\s*Bearer\\s+)\\S+"),
+        QRegularExpression::CaseInsensitiveOption);
+    line.replace(reAuthBearer, QStringLiteral("\\1***"));
+
+    // Mask --user/--pass/--password/-u/-p CLI flags
+    static const QRegularExpression reCliAuth(
+        QStringLiteral("(^|\\s)(--(?:user|pass|password)(?:=|\\s+)|-[up](?:=|\\s+))([^\\s'\"]+)"));
+    line.replace(reCliAuth, QStringLiteral("\\1\\2***"));
 
     return line.trimmed();
 }

@@ -1,5 +1,6 @@
 #include "models.h"
 
+#include <QFileInfo>
 #include <QRegularExpression>
 #include <QUrl>
 
@@ -64,6 +65,12 @@ bool isValidWorkerId(const QString& id)
     return re.match(id).hasMatch();
 }
 
+bool isValidPodmanName(const QString& name)
+{
+    static const QRegularExpression re(QStringLiteral("^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$"));
+    return re.match(name.trimmed()).hasMatch();
+}
+
 bool isValidSshTarget(const QString& target)
 {
     const QString t = target.trimmed();
@@ -73,6 +80,23 @@ bool isValidSshTarget(const QString& target)
     static const QRegularExpression re(
         QStringLiteral("^(?:[a-zA-Z0-9._%+-]+@)?[a-zA-Z0-9\\[][a-zA-Z0-9._:\\[\\]-]{0,254}$"));
     return re.match(t).hasMatch();
+}
+
+bool isExpectedMinerBinaryPath(const QString& path)
+{
+    QString s = path.trimmed();
+    if (s.isEmpty()) {
+        return false;
+    }
+    s.replace(QLatin1Char('\\'), QLatin1Char('/'));
+    QString base = QFileInfo(s).fileName().toLower();
+    if (base.endsWith(QStringLiteral(".exe"))) {
+        base.chop(4);
+    }
+    return base == QStringLiteral("cpuminer")
+        || base.startsWith(QStringLiteral("cpuminer-"))
+        || base == QStringLiteral("ccminer")
+        || base.startsWith(QStringLiteral("ccminer-"));
 }
 
 QString normalizeRpcUrl(const QString& rawUrl)
@@ -293,13 +317,19 @@ WorkerProfile WorkerProfile::fromJson(const QJsonObject& obj)
     p.targetType = targetTypeFromString(obj.value(QStringLiteral("targetType")).toString());
 
     p.confPath = obj.value(QStringLiteral("confPath")).toString();
-    p.podmanName = obj.value(QStringLiteral("podmanName")).toString();
+    p.podmanName = obj.value(QStringLiteral("podmanName")).toString().trimmed();
+    if (p.targetType == TargetType::PodmanContainer && !p.podmanName.isEmpty() && !isValidPodmanName(p.podmanName)) {
+        p.podmanName.clear();
+    }
     p.rpcUrl = obj.value(QStringLiteral("rpcUrl")).toString();
     if (p.targetType == TargetType::CustomRpc || p.targetType == TargetType::RemoteSsh) {
         p.rpcUser = obj.value(QStringLiteral("rpcUser")).toString();
         p.rpcPassword = obj.value(QStringLiteral("rpcPassword")).toString();
     }
-    p.sshTarget = obj.value(QStringLiteral("sshTarget")).toString();
+    p.sshTarget = obj.value(QStringLiteral("sshTarget")).toString().trimmed();
+    if (p.targetType == TargetType::RemoteSsh && !p.sshTarget.isEmpty() && !isValidSshTarget(p.sshTarget)) {
+        p.sshTarget.clear();
+    }
     p.sshPort = obj.value(QStringLiteral("sshPort")).toInt(22);
     if (p.sshPort <= 0 || p.sshPort > 65535) p.sshPort = 22;
     p.remoteBinaryPath = obj.value(QStringLiteral("remoteBinaryPath")).toString();

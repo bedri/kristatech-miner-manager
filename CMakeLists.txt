@@ -4,6 +4,7 @@ project(kristatech-miner-manager VERSION 1.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
@@ -46,8 +47,39 @@ target_link_libraries(kmm_core PUBLIC
     Qt6::Network
 )
 if(WIN32)
-    target_link_libraries(kmm_core PUBLIC kernel32)
+    target_link_libraries(kmm_core PUBLIC kernel32 advapi32)
 endif()
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(kmm_core PRIVATE
+        -Wall
+        -Wextra
+        -Wformat
+        -Wformat-security
+        $<$<BOOL:${UNIX}>:-fstack-protector-strong>
+        $<$<AND:$<BOOL:${UNIX}>,$<NOT:$<CONFIG:Debug>>>:-U_FORTIFY_SOURCE>
+        $<$<AND:$<BOOL:${UNIX}>,$<NOT:$<CONFIG:Debug>>>:-D_FORTIFY_SOURCE=2>
+    )
+endif()
+
+function(kmm_apply_exe_hardening tgt)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(${tgt} PRIVATE
+            -Wall
+            -Wextra
+            -Wformat
+            -Wformat-security
+            $<$<BOOL:${UNIX}>:-fstack-protector-strong>
+            $<$<AND:$<BOOL:${UNIX}>,$<NOT:$<CONFIG:Debug>>>:-U_FORTIFY_SOURCE>
+            $<$<AND:$<BOOL:${UNIX}>,$<NOT:$<CONFIG:Debug>>>:-D_FORTIFY_SOURCE=2>
+        )
+        if(UNIX AND NOT APPLE)
+            target_link_options(${tgt} PRIVATE -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack)
+        elseif(MINGW)
+            target_link_options(${tgt} PRIVATE -Wl,--nxcompat -Wl,--dynamicbase -Wl,--high-entropy-va)
+        endif()
+    endif()
+endfunction()
 
 set(KMM_PLATFORM_SOURCES)
 if(WIN32)
@@ -78,6 +110,7 @@ endif()
 target_link_libraries(kristatech-miner-manager PRIVATE
     kmm_core
 )
+kmm_apply_exe_hardening(kristatech-miner-manager)
 
 if(KMM_BUILD_TESTS)
     enable_testing()
@@ -90,6 +123,7 @@ if(KMM_BUILD_TESTS)
         kmm_core
         Qt6::Test
     )
+    kmm_apply_exe_hardening(test_core)
 
     add_test(NAME core_tests COMMAND test_core)
 
@@ -106,6 +140,7 @@ if(KMM_BUILD_TESTS)
         kmm_core
         Qt6::Test
     )
+    kmm_apply_exe_hardening(test_ui)
 
     add_test(NAME ui_tests COMMAND test_ui)
 endif()

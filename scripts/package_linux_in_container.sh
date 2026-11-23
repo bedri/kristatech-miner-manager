@@ -227,15 +227,41 @@ PAYLOAD_SHA256="$(sha256sum "${TAR_OUT}" | awk '{print $1}')"
 cat > "${RUN_OUT}" <<EOF
 #!/bin/sh
 set -eu
+umask 077
 PAYLOAD_HASH="${PAYLOAD_SHA256}"
-CACHE_BASE="\${XDG_CACHE_HOME:-\${HOME:-/tmp}/.cache}/kristatech-miner-manager-portable"
+CACHE_BASE=""
+CLEANUP_BASE=""
+if [ -n "\${XDG_CACHE_HOME:-}" ]; then
+    CACHE_BASE="\${XDG_CACHE_HOME}/kristatech-miner-manager-portable"
+elif [ -n "\${HOME:-}" ] && [ "\${HOME}" != "/" ]; then
+    CACHE_BASE="\${HOME}/.cache/kristatech-miner-manager-portable"
+else
+    CLEANUP_BASE="\$(mktemp -d "\${TMPDIR:-/tmp}/kmm-run-XXXXXX")"
+    chmod 700 "\${CLEANUP_BASE}"
+    CACHE_BASE="\${CLEANUP_BASE}"
+    trap 'rm -rf "\${CLEANUP_BASE}"' EXIT HUP INT TERM
+fi
+if [ -L "\${CACHE_BASE}" ]; then
+    echo "ERROR: Refusing symlink cache directory: \${CACHE_BASE}" >&2
+    exit 1
+fi
+mkdir -p "\${CACHE_BASE}"
+chmod 700 "\${CACHE_BASE}"
 TARGET_DIR="\${CACHE_BASE}/\${PAYLOAD_HASH}"
+if [ -L "\${TARGET_DIR}" ]; then
+    echo "ERROR: Refusing symlink target directory: \${TARGET_DIR}" >&2
+    exit 1
+fi
 if [ ! -x "\${TARGET_DIR}/bin/kristatech-miner-manager" ]; then
-    mkdir -p "\${CACHE_BASE}"
-    TMP_DIR="\${CACHE_BASE}/.tmp.\${PAYLOAD_HASH}.\$\$"
-    rm -rf "\${TMP_DIR}"
-    mkdir -p "\${TMP_DIR}"
     ARCHIVE_LINE=\$(awk '/^__ARCHIVE_BELOW__\$/{print NR + 1; exit 0}' "\$0")
+    if command -v sha256sum >/dev/null 2>&1; then
+        ACTUAL_HASH=\$(tail -n +"\${ARCHIVE_LINE}" "\$0" | sha256sum | awk '{print \$1}')
+        if [ "\${ACTUAL_HASH}" != "\${PAYLOAD_HASH}" ]; then
+            echo "ERROR: Integrity check failed for portable archive." >&2
+            exit 1
+        fi
+    fi
+    TMP_DIR="\$(mktemp -d "\${CACHE_BASE}/.tmp.\${PAYLOAD_HASH}.XXXXXX")"
     tail -n +"\${ARCHIVE_LINE}" "\$0" | tar -xz -C "\${TMP_DIR}" --strip-components=1
     if [ -d "\${TARGET_DIR}" ]; then
         rm -rf "\${TMP_DIR}"
@@ -243,7 +269,11 @@ if [ ! -x "\${TARGET_DIR}/bin/kristatech-miner-manager" ]; then
         mv "\${TMP_DIR}" "\${TARGET_DIR}" 2>/dev/null || rm -rf "\${TMP_DIR}"
     fi
 fi
-exec "\${TARGET_DIR}/KristaTechMinerManager" "\$@"
+if [ -n "\${CLEANUP_BASE}" ]; then
+    "\${TARGET_DIR}/KristaTechMinerManager" "\$@"
+else
+    exec "\${TARGET_DIR}/KristaTechMinerManager" "\$@"
+fi
 __ARCHIVE_BELOW__
 EOF
 cat "${TAR_OUT}" >> "${RUN_OUT}"

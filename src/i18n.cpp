@@ -207,6 +207,22 @@ void I18n::initTable()
     add("dlg.expiring_warn",
         "Note: This %1 seat expires in %2 block(s) — early renewal window is open.",
         "Not: Bu %1 koltuğunun süresi %2 blok içinde doluyor — erken yenileme penceresi açık.");
+    add("dlg.insecure_http_warn",
+        "Warning: Unencrypted http:// to a non-loopback Custom RPC host transmits RPC credentials in plaintext. Prefer https:// or an SSH tunnel.",
+        "Uyarı: Yerel olmayan (non-loopback) Özel RPC sunucusuna şifresiz http:// kullanmak RPC parolasını düz metin gönderir. https:// veya SSH tüneli önerilir.");
+    add("dlg.invalid_podman",
+        "Invalid Podman container name (allowed: letters, digits, '.', '_', '-'; cannot start with '-').",
+        "Geçersiz Podman konteyner adı (izin verilen: harf, rakam, '.', '_', '-'; '-' ile başlayamaz).");
+    add("dlg.test_bin_confirm_title", "Confirm Arbitrary Binary Execution", "Standart Dışı İkili Çalıştırma Onayı");
+    add("dlg.test_bin_confirm_msg",
+        "The selected executable (%1) is not a standard cpuminer/ccminer binary.\n\nRun \"%1 --version\" anyway?",
+        "Seçili yürütülebilir dosya (%1) standart bir cpuminer/ccminer ikilisi değil.\n\nYine de \"%1 --version\" çalıştırılsın mı?");
+    add("import.warn_title", "Security Review — Imported Profiles", "Güvenlik İncelemesi — İçe Aktarılan Profiller");
+    add("import.warn_msg",
+        "The imported file contains fields that should be reviewed before running:\n\n%1\n\nChoose \"Import Safely\" to reset custom binaries, extra flags, and non-default .conf paths to safe defaults.",
+        "İçe aktarılan dosya çalıştırmadan önce incelenmesi gereken alanlar içeriyor:\n\n%1\n\nÖzel ikili yollarını, ek parametreleri ve standart dışı .conf yollarını güvenli varsayılanlara sıfırlamak için \"Güvenli İçe Aktar\" seçeneğini kullanın.");
+    add("import.btn_safe", "Import Safely (Reset Custom Paths/Flags)", "Güvenli İçe Aktar (Yol/Bayrakları Sıfırla)");
+    add("import.btn_trust", "Import As-Is (Trust File)", "Olduğu Gibi İçe Aktar (Dosyaya Güven)");
 
     // Tray & Close dialogs
     add("tray.show", "Show Miner Manager", "Yöneticiyi Göster");

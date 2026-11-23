@@ -39,6 +39,7 @@ private Q_SLOTS:
     void testCustomRpcLifecycleAndJsonRpc();
     void testRemoteSshLifecycleAndHealthCheck();
     void testKristaFairnessRpcAndSeatExpiry();
+    void testSecurityHardening();
 };
 
 void TestCore::testParseKristaTechConf()
@@ -945,6 +946,8 @@ void TestCore::testRemoteSshLifecycleAndHealthCheck()
             "CMD=\"\"\n"
             "SAW_DASHDASH=0\n"
             "SEEN_BATCHMODE=0\n"
+            "SEEN_NOTTY=0\n"
+            "SEEN_CLEARFWD=0\n"
             "PORT_VAL=\"\"\n"
             "while [ \"$#\" -gt 0 ]; do\n"
             "  if [ \"$SAW_DASHDASH\" -eq 1 ]; then\n"
@@ -956,6 +959,8 @@ void TestCore::testRemoteSshLifecycleAndHealthCheck()
             "  case \"$1\" in\n"
             "    -o)\n"
             "      if [ \"$2\" = \"BatchMode=yes\" ]; then SEEN_BATCHMODE=1; fi\n"
+            "      if [ \"$2\" = \"RequestTTY=no\" ]; then SEEN_NOTTY=1; fi\n"
+            "      if [ \"$2\" = \"ClearAllForwardings=yes\" ]; then SEEN_CLEARFWD=1; fi\n"
             "      shift 2\n"
             "      ;;\n"
             "    -p)\n"
@@ -978,7 +983,7 @@ void TestCore::testRemoteSshLifecycleAndHealthCheck()
             "      ;;\n"
             "  esac\n"
             "done\n"
-            "if [ \"$SAW_DASHDASH\" -ne 1 ] || [ \"$SEEN_BATCHMODE\" -ne 1 ] || [ -z \"$TARGET\" ]; then\n"
+            "if [ \"$SAW_DASHDASH\" -ne 1 ] || [ \"$SEEN_BATCHMODE\" -ne 1 ] || [ \"$SEEN_NOTTY\" -ne 1 ] || [ \"$SEEN_CLEARFWD\" -ne 1 ] || [ -z \"$TARGET\" ]; then\n"
             "  echo \"ssh wrapper assertion failed\" >&2\n"
             "  exit 98\n"
             "fi\n"
@@ -1475,6 +1480,271 @@ void TestCore::testKristaFairnessRpcAndSeatExpiry()
     QCOMPARE(registerCalls[1].second.at(0).toString(), QStringLiteral("pow"));
     QCOMPARE(registerCalls[1].second.at(1).toString(), QStringLiteral(""));
     QCOMPARE(registerCalls[1].second.at(2).toString(), QStringLiteral("KTPw000000000000000000000000000003"));
+}
+
+void TestCore::testSecurityHardening()
+{
+    // 1. Podman name & expected miner binary validation
+    QVERIFY(isValidPodmanName(QStringLiteral("krista-cold-01")));
+    QVERIFY(isValidPodmanName(QStringLiteral("node_2.test")));
+    QVERIFY(!isValidPodmanName(QString()));
+    QVERIFY(!isValidPodmanName(QStringLiteral("-n")));
+    QVERIFY(!isValidPodmanName(QStringLiteral("--privileged")));
+    QVERIFY(!isValidPodmanName(QStringLiteral("pod;rm -rf /")));
+    QVERIFY(!isValidPodmanName(QStringLiteral("../escape")));
+
+    QVERIFY(isExpectedMinerBinaryPath(QStringLiteral("/usr/local/bin/cpuminer")));
+    QVERIFY(isExpectedMinerBinaryPath(QStringLiteral("cpuminer-opt")));
+    QVERIFY(isExpectedMinerBinaryPath(QStringLiteral("C:\\miners\\ccminer.exe")));
+    QVERIFY(!isExpectedMinerBinaryPath(QString()));
+    QVERIFY(!isExpectedMinerBinaryPath(QStringLiteral("/bin/sh")));
+    QVERIFY(!isExpectedMinerBinaryPath(QStringLiteral("C:\\Windows\\System32\\cmd.exe")));
+
+    // 2. WorkerProfile::fromJson strips unsafe Podman/SSH target fields
+    {
+        QJsonObject obj;
+        obj.insert(QStringLiteral("id"), QStringLiteral("pod_bad"));
+        obj.insert(QStringLiteral("name"), QStringLiteral("Bad Pod"));
+        obj.insert(QStringLiteral("targetType"), QStringLiteral("podman"));
+        obj.insert(QStringLiteral("podmanName"), QStringLiteral("--privileged"));
+        const WorkerProfile p = WorkerProfile::fromJson(obj);
+        QVERIFY(p.podmanName.isEmpty());
+    }
+    {
+        QJsonObject obj;
+        obj.insert(QStringLiteral("id"), QStringLiteral("ssh_bad"));
+        obj.insert(QStringLiteral("name"), QStringLiteral("Bad SSH"));
+        obj.insert(QStringLiteral("targetType"), QStringLiteral("ssh"));
+        obj.insert(QStringLiteral("sshTarget"), QStringLiteral("-oProxyCommand=evil"));
+        const WorkerProfile p = WorkerProfile::fromJson(obj);
+        QVERIFY(p.sshTarget.isEmpty());
+    }
+
+    // 3. ConfigStore & RpcClient reject invalid podmanName cleanly
+    WorkerProfile badPod;
+    badPod.id = QStringLiteral("bad_pod");
+    badPod.name = QStringLiteral("Bad Pod");
+    badPod.targetType = TargetType::PodmanContainer;
+    badPod.podmanName = QStringLiteral("--privileged");
+    const RpcCredentials podCreds = ConfigStore::resolveCredentials(badPod);
+    QVERIFY(!podCreds.valid);
+    QVERIFY(podCreds.error.contains(QStringLiteral("Invalid Podman container name")));
+
+    RpcClient rpc;
+    bool podRpcDone = false, podRpcOk = true;
+    QString podRpcErr;
+    rpc.setInternalGenerate(badPod, false, [&](bool ok, const QString& err) {
+        podRpcDone = true;
+        podRpcOk = ok;
+        podRpcErr = err;
+    });
+    QTRY_VERIFY_WITH_TIMEOUT(podRpcDone, 2000);
+    QVERIFY(!podRpcOk);
+    QVERIFY(podRpcErr.contains(QStringLiteral("Invalid Podman container name")));
+
+    // 4. Expanded credential redaction in logs
+    const QString rawSecrets = QStringLiteral(
+        "Authorization: Basic dXNlcjpzZWNyZXQ= | Authorization: Bearer mySecretJwt123 | "
+        "cmd --user alice --pass hunter2 -u bob -p p@ssw0rd");
+    const QString masked = ConfigStore::sanitizeLogLine(rawSecrets);
+    QVERIFY(!masked.contains(QStringLiteral("dXNlcjpzZWNyZXQ=")));
+    QVERIFY(!masked.contains(QStringLiteral("mySecretJwt123")));
+    QVERIFY(!masked.contains(QStringLiteral("alice")));
+    QVERIFY(!masked.contains(QStringLiteral("hunter2")));
+    QVERIFY(!masked.contains(QStringLiteral("bob")));
+    QVERIFY(!masked.contains(QStringLiteral("p@ssw0rd")));
+    QVERIFY(masked.contains(QStringLiteral("Authorization: Basic ***")));
+    QVERIFY(masked.contains(QStringLiteral("Authorization: Bearer ***")));
+
+    // 5. Import security inspection & sanitization
+    WorkerProfile riskyLocal;
+    riskyLocal.id = QStringLiteral("risk_local");
+    riskyLocal.name = QStringLiteral("Risky Local");
+    riskyLocal.targetType = TargetType::LocalWallet;
+    riskyLocal.binaryPath = QStringLiteral("/bin/sh");
+    riskyLocal.confPath = QStringLiteral("/tmp/evil.conf");
+    riskyLocal.extraArgs = QStringLiteral("--api-remote");
+
+    WorkerProfile riskyHttp;
+    riskyHttp.id = QStringLiteral("risk_http");
+    riskyHttp.name = QStringLiteral("Risky HTTP");
+    riskyHttp.targetType = TargetType::CustomRpc;
+    riskyHttp.rpcUrl = QStringLiteral("http://198.51.100.10:27998/");
+
+    QVector<WorkerProfile> imported{riskyLocal, riskyHttp};
+    const ImportSecurityReport rep = ConfigStore::inspectImportedProfiles(imported);
+    QVERIFY(rep.hasRiskyFields());
+    QCOMPARE(rep.customBinaryCount, 1);
+    QCOMPARE(rep.extraArgsCount, 1);
+    QCOMPARE(rep.customConfCount, 1);
+    QCOMPARE(rep.plaintextRemoteHttpCount, 1);
+
+    ConfigStore::sanitizeImportedProfiles(imported);
+    QVERIFY(imported[0].binaryPath.isEmpty());
+    QVERIFY(imported[0].extraArgs.isEmpty());
+    QCOMPARE(imported[0].confPath, ConfigStore::defaultKristaTechConfPath());
+
+    // 6. HTTP JSON-RPC 16 MiB response cap aborts cleanly
+    QTcpServer hugeServer;
+    QVERIFY(hugeServer.listen(QHostAddress::LocalHost, 0));
+    QObject::connect(&hugeServer, &QTcpServer::newConnection, &hugeServer, [&]() {
+        while (QTcpSocket* sock = hugeServer.nextPendingConnection()) {
+            QObject::connect(sock, &QTcpSocket::readyRead, sock, [sock]() {
+                sock->readAll();
+                const QByteArray hdr =
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: 20000000\r\n"
+                    "Connection: close\r\n\r\n{";
+                sock->write(hdr);
+                sock->flush();
+            });
+            QObject::connect(sock, &QTcpSocket::disconnected, sock, &QObject::deleteLater);
+        }
+    });
+
+    WorkerProfile capProf;
+    capProf.id = QStringLiteral("cap_rpc");
+    capProf.name = QStringLiteral("Cap RPC");
+    capProf.targetType = TargetType::CustomRpc;
+    capProf.rpcUrl = QStringLiteral("127.0.0.1:%1").arg(hugeServer.serverPort());
+    capProf.rpcUser = QStringLiteral("u");
+    capProf.rpcPassword = QStringLiteral("p");
+
+    bool capDone = false, capOk = true;
+    QString capErr;
+    rpc.setInternalGenerate(capProf, false, [&](bool ok, const QString& err) {
+        capDone = true;
+        capOk = ok;
+        capErr = err;
+    });
+    QTRY_VERIFY_WITH_TIMEOUT(capDone, 4000);
+    QVERIFY(!capOk);
+    QVERIFY(capErr.contains(QStringLiteral("16 MiB")));
+
+    // 7. Orphaned run/*.json cleanup removes stopped configs while leaving directories 0700
+    QTemporaryDir tmpDir;
+    QVERIFY(tmpDir.isValid());
+    ConfigStore store(tmpDir.filePath(QStringLiteral("sec_cfg")));
+    QVERIFY(store.ensureDirectories());
+    QVERIFY(ConfigStore::writeFile0600(store.runtimeJsonPath(QStringLiteral("orphan_1")), QByteArray("{}")));
+
+    WorkerProfile stoppedProf;
+    stoppedProf.id = QStringLiteral("stopped_prof");
+    stoppedProf.name = QStringLiteral("Stopped Prof");
+    stoppedProf.targetType = TargetType::LocalWallet;
+    QVERIFY(store.saveProfiles({stoppedProf}));
+    QVERIFY(ConfigStore::writeFile0600(store.runtimeJsonPath(stoppedProf.id), QByteArray("{\"secret\":\"x\"}")));
+
+    RpcClient localRpc;
+    WorkerController ctrl(&store, &localRpc);
+    ctrl.loadInitialState(/*autoDiscoverIfEmpty=*/false);
+    QVERIFY(!QFileInfo::exists(store.runtimeJsonPath(QStringLiteral("orphan_1"))));
+    QVERIFY(!QFileInfo::exists(store.runtimeJsonPath(stoppedProf.id)));
+
+    // 8. PID identity verification rejects unrelated current process
+    QVERIFY(!ProcessScanner::isManagedMinerOrWrapperPid(QCoreApplication::applicationPid()));
+
+#ifndef Q_OS_WIN
+    // 9. Bounded SSH log tail & corrupted .pid guard on POSIX
+    const QString binDir = tmpDir.filePath(QStringLiteral("bin"));
+    const QString remoteHome = tmpDir.filePath(QStringLiteral("remote_home"));
+    QVERIFY(QDir().mkpath(binDir));
+    QVERIFY(QDir().mkpath(remoteHome + QStringLiteral("/.kristatech-mm")));
+
+    const QString fakeSsh = binDir + QStringLiteral("/ssh");
+    {
+        QFile f(fakeSsh);
+        QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        const QByteArray script = QStringLiteral(
+            "#!/bin/sh\n"
+            "REMOTE_HOME=\"%1\"\n"
+            "SAW_NOTTY=0\n"
+            "SAW_CLEARFWD=0\n"
+            "SAW_DD=0\n"
+            "TARGET=\"\"\n"
+            "CMD=\"\"\n"
+            "while [ \"$#\" -gt 0 ]; do\n"
+            "  if [ \"$SAW_DD\" -eq 1 ]; then TARGET=\"$1\"; shift; CMD=\"$*\"; break; fi\n"
+            "  case \"$1\" in\n"
+            "    -o)\n"
+            "      if [ \"$2\" = \"RequestTTY=no\" ]; then SAW_NOTTY=1; fi\n"
+            "      if [ \"$2\" = \"ClearAllForwardings=yes\" ]; then SAW_CLEARFWD=1; fi\n"
+            "      shift 2 ;;\n"
+            "    -p) shift 2 ;;\n"
+            "    --) SAW_DD=1; shift ;;\n"
+            "    *) TARGET=\"$1\"; shift; CMD=\"$*\"; break ;;\n"
+            "  esac\n"
+            "done\n"
+            "if [ \"$SAW_NOTTY\" -ne 1 ] || [ \"$SAW_CLEARFWD\" -ne 1 ]; then exit 97; fi\n"
+            "exec env HOME=\"$REMOTE_HOME\" /bin/sh -c \"$CMD\"\n")
+            .arg(remoteHome).toUtf8();
+        f.write(script);
+        f.close();
+        QVERIFY(f.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner));
+    }
+
+    const QByteArray origPath = qgetenv("PATH");
+    struct PathGuard {
+        QByteArray orig;
+        ~PathGuard() { qputenv("PATH", orig); }
+    } pathGuard{origPath};
+    qputenv("PATH", binDir.toUtf8() + ':' + origPath);
+
+    // Corrupted .pid with "-1" must be treated as DEAD by checkRemoteSshHealthNow without calling kill
+    WorkerProfile sshP;
+    sshP.id = QStringLiteral("ssh_sec");
+    sshP.name = QStringLiteral("SSH Sec");
+    sshP.targetType = TargetType::RemoteSsh;
+    sshP.sshTarget = QStringLiteral("miner@192.0.2.10");
+    sshP.rpcUrl = QStringLiteral("127.0.0.1:27998");
+    sshP.rpcUser = QStringLiteral("u");
+    sshP.rpcPassword = QStringLiteral("p");
+    sshP.autoRestart = false;
+    sshP.remoteBinaryPath = QStringLiteral("/usr/bin/printf");
+    ctrl.addProfile(sshP);
+
+    // Test bounded 64 KiB tail buffer when fake ssh emits >100 KiB without newline
+    {
+        QFile fakeShTail(binDir + QStringLiteral("/ssh"));
+        QVERIFY(fakeShTail.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        fakeShTail.write(QStringLiteral(
+            "#!/bin/sh\n"
+            "CMD=\"\"; SAW_DD=0\n"
+            "while [ \"$#\" -gt 0 ]; do\n"
+            "  if [ \"$SAW_DD\" -eq 1 ]; then shift; CMD=\"$*\"; break; fi\n"
+            "  case \"$1\" in -o|-p) shift 2 ;; --) SAW_DD=1; shift ;; *) shift; CMD=\"$*\"; break ;; esac\n"
+            "done\n"
+            "case \"$CMD\" in\n"
+            "  *\"umask 077\"*) cat > /dev/null; exit 0 ;;\n"
+            "  *\"nohup \"*) sleep 30 & echo $!; exit 0 ;;\n"
+            "  *\"tail \"*) head -c 102400 /dev/zero | tr '\\0' 'A'; exec sleep 5 ;;\n"
+            "  *\"~/.kristatech-mm/ssh_sec.pid\"*) exec env HOME=\"%1\" /bin/sh -c \"$CMD\" ;;\n"
+            "esac\n"
+            "exit 0\n").arg(remoteHome).toUtf8());
+        fakeShTail.close();
+        QVERIFY(fakeShTail.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner));
+    }
+
+    ctrl.startWorker(sshP.id);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        !ctrl.runtimeById(sshP.id).logLines.isEmpty()
+        && ctrl.runtimeById(sshP.id).logLines.last().contains(QStringLiteral("[truncated]")),
+        4000);
+    QVERIFY(ctrl.runtimeById(sshP.id).logLines.last().size() <= 66000);
+
+    // Write corrupted "-1" into remote .pid and run checkRemoteSshHealthNow -> must transition cleanly to Error ("DEAD")
+    {
+        QFile pidF(remoteHome + QStringLiteral("/.kristatech-mm/ssh_sec.pid"));
+        QVERIFY(pidF.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        pidF.write("-1\n");
+        pidF.close();
+    }
+    ctrl.checkRemoteSshHealthNow();
+    QTRY_COMPARE_WITH_TIMEOUT(ctrl.runtimeById(sshP.id).status, WorkerStatus::Error, 4000);
+    ctrl.stopWorker(sshP.id);
+    QTest::qWait(100);
+#endif
 }
 
 QTEST_MAIN(TestCore)

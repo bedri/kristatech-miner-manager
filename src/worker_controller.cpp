@@ -55,10 +55,18 @@ bool isValidCpuAffinity(const QString& affinity)
     return re.match(affinity.trimmed()).hasMatch();
 }
 
-bool isValidPodmanName(const QString& name)
+void cancelStartupProcess(QHash<QString, QProcess*>& map, const QString& id, QObject* receiver)
 {
-    static const QRegularExpression re(QStringLiteral("^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$"));
-    return re.match(name.trimmed()).hasMatch();
+    QProcess* proc = map.take(id);
+    if (!proc) return;
+    proc->disconnect(receiver);
+    if (proc->state() != QProcess::NotRunning) {
+        proc->terminate();
+        QObject::connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                         proc, &QProcess::deleteLater);
+    } else {
+        proc->deleteLater();
+    }
 }
 
 #ifndef Q_OS_WIN
@@ -289,7 +297,38 @@ void WorkerController::loadInitialState(bool autoDiscoverIfEmpty)
     } else {
         adoptRunningProcesses(/*createProfilesForUnknown=*/false);
     }
+    cleanupOrphanedRuntimeConfigs();
     Q_EMIT workersChanged();
+}
+
+int WorkerController::cleanupOrphanedRuntimeConfigs()
+{
+    if (!m_store) return 0;
+    const QDir runDir(m_store->runtimeDirPath());
+    if (!runDir.exists()) return 0;
+
+    QSet<QString> activeLocalIds;
+    for (const WorkerProfile& p : m_profiles) {
+        if (p.targetType == TargetType::RemoteSsh) continue;
+        const WorkerRuntime rt = m_runtimes.value(p.id);
+        if (rt.pid > 0 && rt.status != WorkerStatus::Stopped && rt.status != WorkerStatus::Error) {
+            activeLocalIds.insert(p.id);
+        }
+    }
+
+    int removed = 0;
+    const QStringList files = runDir.entryList({QStringLiteral("*.json")}, QDir::Files);
+    for (const QString& fname : files) {
+        const QString baseId = fname.endsWith(QStringLiteral(".json"))
+            ? fname.left(fname.size() - 5)
+            : QFileInfo(fname).completeBaseName();
+        if (!activeLocalIds.contains(baseId)) {
+            if (QFile::remove(runDir.filePath(fname))) {
+                ++removed;
+            }
+        }
+    }
+    return removed;
 }
 
 bool WorkerController::saveProfiles(QString* err)
@@ -338,8 +377,8 @@ bool WorkerController::removeProfile(const QString& id, bool stopIfRunning)
     if (stopIfRunning && rt.pid > 0 && m_profiles[idx].targetType != TargetType::RemoteSsh) {
         stopWorker(id);
     }
-    m_podmanStartProcs.take(id);
-    m_sshStartProcs.take(id);
+    cancelStartupProcess(m_podmanStartProcs, id, this);
+    cancelStartupProcess(m_sshStartProcs, id, this);
     m_sshHealthInflight.remove(id);
     detachSshLogTail(id);
     QFile::remove(m_store->runtimeJsonPath(id));
@@ -881,15 +920,21 @@ void WorkerController::startRemoteSsh(const WorkerProfile& p, WorkerRuntime& rt)
                 startProc->start(sshBin,
                                  {QStringLiteral("-o"), QStringLiteral("BatchMode=yes"),
                                   QStringLiteral("-o"), QStringLiteral("ConnectTimeout=8"),
+                                  QStringLiteral("-o"), QStringLiteral("RequestTTY=no"),
+                                  QStringLiteral("-o"), QStringLiteral("ClearAllForwardings=yes"),
                                   QStringLiteral("-p"), portStr,
                                   QStringLiteral("--"),
                                   sshTarget, remoteWrap});
             });
 
-    const QString uploadCmd = QStringLiteral("umask 077 && mkdir -p ~/.kristatech-mm && cat > ") + remoteJson;
+    const QString uploadCmd = QStringLiteral(
+        "umask 077 && mkdir -p ~/.kristatech-mm && chmod 700 ~/.kristatech-mm && cat > %1 && chmod 600 %1")
+        .arg(remoteJson);
     uploadProc->start(sshBin,
                       {QStringLiteral("-o"), QStringLiteral("BatchMode=yes"),
                        QStringLiteral("-o"), QStringLiteral("ConnectTimeout=8"),
+                       QStringLiteral("-o"), QStringLiteral("RequestTTY=no"),
+                       QStringLiteral("-o"), QStringLiteral("ClearAllForwardings=yes"),
                        QStringLiteral("-p"), portStr,
                        QStringLiteral("--"),
                        sshTarget, uploadCmd});
@@ -912,9 +957,10 @@ void WorkerController::attachSshLogTail(const WorkerProfile& p)
 
     connect(tailProc, &QProcess::readyReadStandardOutput, this, [this, tailProc, workerId]() {
         if (!m_runtimes.contains(workerId)) return;
+        static constexpr qsizetype kMaxSshTailBufferBytes = 65536;
         QByteArray& buf = m_sshTailBuffers[workerId];
         buf.append(tailProc->readAllStandardOutput());
-        int nl = -1;
+        qsizetype nl = -1;
         QStringList completeLines;
         while ((nl = buf.indexOf('\n')) >= 0) {
             QByteArray lineBytes = buf.left(nl);
@@ -922,10 +968,20 @@ void WorkerController::attachSshLogTail(const WorkerProfile& p)
                 lineBytes.chop(1);
             }
             buf.remove(0, nl + 1);
+            if (lineBytes.size() > kMaxSshTailBufferBytes) {
+                lineBytes = lineBytes.left(kMaxSshTailBufferBytes) + "... [truncated]";
+            }
             const QString line = QString::fromUtf8(lineBytes).trimmed();
             if (!line.isEmpty()) {
                 completeLines.append(line);
             }
+        }
+        if (buf.size() > kMaxSshTailBufferBytes) {
+            const QString line = QString::fromUtf8(buf.left(kMaxSshTailBufferBytes)).trimmed();
+            if (!line.isEmpty()) {
+                completeLines.append(line + QStringLiteral(" [truncated]"));
+            }
+            buf.clear();
         }
         if (!completeLines.isEmpty()) {
             appendSanitizedLines(workerId, m_runtimes[workerId], completeLines);
@@ -951,6 +1007,8 @@ void WorkerController::attachSshLogTail(const WorkerProfile& p)
     tailProc->start(sshBin,
                     {QStringLiteral("-o"), QStringLiteral("BatchMode=yes"),
                      QStringLiteral("-o"), QStringLiteral("ServerAliveInterval=15"),
+                     QStringLiteral("-o"), QStringLiteral("RequestTTY=no"),
+                     QStringLiteral("-o"), QStringLiteral("ClearAllForwardings=yes"),
                      QStringLiteral("-p"), portStr,
                      QStringLiteral("--"),
                      sshTarget,
@@ -995,8 +1053,8 @@ void WorkerController::stopRemoteSsh(const WorkerProfile& p, WorkerRuntime& rt)
     const QString portStr = QString::number(p.sshPort > 0 ? p.sshPort : 22);
     const QString cmd = QStringLiteral(
         "if [ -f ~/.kristatech-mm/%1.pid ]; then "
-        "P=\"$(cat ~/.kristatech-mm/%1.pid)\"; "
-        "kill -TERM \"$P\" 2>/dev/null || true; "
+        "P=\"$(tr -d '[:space:]' < ~/.kristatech-mm/%1.pid)\"; "
+        "case \"$P\" in ''|*[!0-9]*|0|1) ;; *) kill -TERM \"$P\" 2>/dev/null || true ;; esac; "
         "fi; rm -f ~/.kristatech-mm/%1.json ~/.kristatech-mm/%1.pid")
         .arg(p.id);
 
@@ -1011,6 +1069,8 @@ void WorkerController::stopRemoteSsh(const WorkerProfile& p, WorkerRuntime& rt)
     proc->start(sshBin,
                 {QStringLiteral("-o"), QStringLiteral("BatchMode=yes"),
                  QStringLiteral("-o"), QStringLiteral("ConnectTimeout=6"),
+                 QStringLiteral("-o"), QStringLiteral("RequestTTY=no"),
+                 QStringLiteral("-o"), QStringLiteral("ClearAllForwardings=yes"),
                  QStringLiteral("-p"), portStr,
                  QStringLiteral("--"),
                  sshTarget, cmd});
@@ -1022,8 +1082,8 @@ void WorkerController::stopWorker(const QString& id)
     const int idx = indexOfId(id);
     if (idx < 0) return;
 
-    m_podmanStartProcs.take(id);
-    m_sshStartProcs.take(id);
+    cancelStartupProcess(m_podmanStartProcs, id, this);
+    cancelStartupProcess(m_sshStartProcs, id, this);
     m_sshHealthInflight.remove(id);
     const WorkerProfile& p = m_profiles[idx];
     WorkerRuntime& rt = m_runtimes[id];
@@ -1051,10 +1111,12 @@ void WorkerController::stopWorker(const QString& id)
 
     if (minerPid > 1 || wrapPid > 1) {
         QTimer::singleShot(2500, this, [minerPid, wrapPid]() {
-            if (minerPid > 1 && ProcessScanner::isPidAlive(minerPid)) {
+            if (minerPid > 1 && ProcessScanner::isPidAlive(minerPid)
+                && ProcessScanner::isManagedMinerOrWrapperPid(minerPid)) {
                 terminateProcessByPid(minerPid, /*force=*/true);
             }
-            if (wrapPid > 1 && wrapPid != minerPid && ProcessScanner::isPidAlive(wrapPid)) {
+            if (wrapPid > 1 && wrapPid != minerPid && ProcessScanner::isPidAlive(wrapPid)
+                && ProcessScanner::isManagedMinerOrWrapperPid(wrapPid)) {
                 terminateProcessByPid(wrapPid, /*force=*/true);
             }
         });
@@ -1152,7 +1214,7 @@ int WorkerController::stopUnregisteredOrDeferred()
     for (const QString& id : ids) {
         stopWorker(id);
     }
-    return ids.size();
+    return static_cast<int>(ids.size());
 }
 
 bool WorkerController::isWorkerRunning(const WorkerProfile& p, const WorkerRuntime& rt) const
@@ -1295,7 +1357,7 @@ int WorkerController::adoptRunningProcesses(bool createProfilesForUnknown)
             np.gpuDevices = dp.gpuDevices;
             np.gpuIntensity = dp.gpuIntensity;
             m_profiles.append(np);
-            matchIdx = m_profiles.size() - 1;
+            matchIdx = static_cast<int>(m_profiles.size()) - 1;
         }
         if (matchIdx < 0) continue;
 
@@ -1324,7 +1386,7 @@ int WorkerController::adoptRunningProcesses(bool createProfilesForUnknown)
 
 void WorkerController::autoDiscoverFleet(std::function<void(int added, int adopted)> cb)
 {
-    const int prevCount = m_profiles.size();
+    const int prevCount = static_cast<int>(m_profiles.size());
     const int adopted = adoptRunningProcesses(/*createProfilesForUnknown=*/true);
 
     auto hasProfileFor = [this](TargetType t, const QString& pod, const QString& addr) -> bool {
@@ -1359,7 +1421,7 @@ void WorkerController::autoDiscoverFleet(std::function<void(int added, int adopt
 
     const QString localConf = ConfigStore::defaultKristaTechConfPath();
     if (!m_rpc) {
-        const int added = m_profiles.size() - prevCount;
+        const int added = static_cast<int>(m_profiles.size()) - prevCount;
         if (added > 0) saveProfiles();
         Q_EMIT workersChanged();
         Q_EMIT discoveryFinished(added, adopted);
@@ -1390,7 +1452,7 @@ void WorkerController::autoDiscoverFleet(std::function<void(int added, int adopt
                 m_runtimes.insert(p.id, rt);
             }
         }
-        const int added = m_profiles.size() - prevCount;
+        const int added = static_cast<int>(m_profiles.size()) - prevCount;
         saveProfiles();
         Q_EMIT workersChanged();
         Q_EMIT discoveryFinished(added, adopted);
@@ -1403,8 +1465,14 @@ void WorkerController::stopAllManagedAndCleanup()
     m_logTimer.stop();
     m_healthTimer.stop();
     detachSshLogTail(QString());
-    m_podmanStartProcs.clear();
-    m_sshStartProcs.clear();
+    const QStringList podStartIds = m_podmanStartProcs.keys();
+    for (const QString& pidKey : podStartIds) {
+        cancelStartupProcess(m_podmanStartProcs, pidKey, this);
+    }
+    const QStringList sshStartIds = m_sshStartProcs.keys();
+    for (const QString& sshKey : sshStartIds) {
+        cancelStartupProcess(m_sshStartProcs, sshKey, this);
+    }
     m_sshHealthInflight.clear();
     discardAsyncProcess(m_podmanNsCheckProc, this);
 
@@ -1702,8 +1770,10 @@ void WorkerController::checkRemoteSshHealthNow()
         auto completed = std::make_shared<bool>(false);
         const QString portStr = QString::number(p.sshPort > 0 ? p.sshPort : 22);
         const QString remoteCmd = QStringLiteral(
-            "if [ -f ~/.kristatech-mm/%1.pid ] && kill -0 \"$(cat ~/.kristatech-mm/%1.pid)\" 2>/dev/null; then "
-            "cat ~/.kristatech-mm/%1.pid; else echo DEAD; fi").arg(id);
+            "if [ -f ~/.kristatech-mm/%1.pid ]; then "
+            "P=\"$(tr -d '[:space:]' < ~/.kristatech-mm/%1.pid)\"; "
+            "case \"$P\" in ''|*[!0-9]*|0|1) echo DEAD ;; *) if kill -0 \"$P\" 2>/dev/null; then echo \"$P\"; else echo DEAD; fi ;; esac; "
+            "else echo DEAD; fi").arg(id);
 
         connect(chk, &QProcess::errorOccurred, this, [this, chk, id, completed](QProcess::ProcessError err) {
             if (err != QProcess::FailedToStart || *completed) return;
@@ -1745,6 +1815,8 @@ void WorkerController::checkRemoteSshHealthNow()
         chk->start(sshBin,
                    {QStringLiteral("-o"), QStringLiteral("BatchMode=yes"),
                     QStringLiteral("-o"), QStringLiteral("ConnectTimeout=5"),
+                    QStringLiteral("-o"), QStringLiteral("RequestTTY=no"),
+                    QStringLiteral("-o"), QStringLiteral("ClearAllForwardings=yes"),
                     QStringLiteral("-p"), portStr,
                     QStringLiteral("--"),
                     sshTarget, remoteCmd});

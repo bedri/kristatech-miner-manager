@@ -34,6 +34,9 @@ public:
     /** Checks whether a process PID is currently alive (signal 0). */
     static bool isPidAlive(qint64 pid);
 
+    /** Verifies whether PID still belongs to a miner or wrapper binary (guards against PID reuse before SIGKILL). */
+    static bool isManagedMinerOrWrapperPid(qint64 pid);
+
     /** Finds child PID of wrapper (e.g., podman unshare nsenter -> cpuminer). */
     static qint64 findChildMinerPid(qint64 parentPid);
 

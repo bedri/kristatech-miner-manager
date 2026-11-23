@@ -762,7 +762,7 @@ void MainWindow::rebuildTable()
         m_table->selectionModel()->clearCurrentIndex();
     }
     m_table->setSortingEnabled(false);
-    m_table->setRowCount(profiles.size());
+    m_table->setRowCount(static_cast<int>(profiles.size()));
 
     QFont btnFont = m_table->font();
     btnFont.setPixelSize(12);
@@ -1113,7 +1113,7 @@ void MainWindow::onFilterChanged()
 void MainWindow::updateKpis()
 {
     const auto& profiles = m_controller->profiles();
-    int total = profiles.size();
+    int total = static_cast<int>(profiles.size());
     int running = 0;
     int cpuCount = 0;
     int gpuCount = 0;
@@ -1125,7 +1125,7 @@ void MainWindow::updateKpis()
 
     qint64 bestHeight = 0;
     const auto knownSeats = m_rpc->allKnownSeats();
-    int poolSize = knownSeats.size();
+    int poolSize = static_cast<int>(knownSeats.size());
     int mnCount = 0;
     int clCount = 0;
     int powCount = 0;
@@ -1589,10 +1589,33 @@ void MainWindow::onImportProfiles()
         return;
     }
     QString err;
-    const QVector<WorkerProfile> imported = m_store->parseImportedProfilesJson(f.readAll(), &err);
+    QVector<WorkerProfile> imported = m_store->parseImportedProfilesJson(f.readAll(), &err);
     if (!err.isEmpty()) {
         QMessageBox::warning(this, KTr(QStringLiteral("btn.import")), err);
         return;
+    }
+    const ImportSecurityReport secReport = ConfigStore::inspectImportedProfiles(imported);
+    if (secReport.hasRiskyFields()) {
+        QMessageBox box(this);
+        box.setIcon(QMessageBox::Warning);
+        box.setWindowTitle(KTr(QStringLiteral("import.warn_title")));
+        const QString summary = secReport.flaggedDetails.mid(0, 8).join(QLatin1Char('\n'))
+            + (secReport.flaggedDetails.size() > 8
+                   ? QStringLiteral("\n... (+%1 more)").arg(secReport.flaggedDetails.size() - 8)
+                   : QString());
+        box.setText(KTr(QStringLiteral("import.warn_msg")).arg(summary));
+        QPushButton* btnSafe = box.addButton(KTr(QStringLiteral("import.btn_safe")), QMessageBox::AcceptRole);
+        QPushButton* btnTrust = box.addButton(KTr(QStringLiteral("import.btn_trust")), QMessageBox::DestructiveRole);
+        QPushButton* btnCancel = box.addButton(KTr(QStringLiteral("dlg.cancel")), QMessageBox::RejectRole);
+        box.setDefaultButton(btnSafe);
+        box.exec();
+        if (box.clickedButton() == btnCancel || box.clickedButton() == nullptr) {
+            return;
+        }
+        if (box.clickedButton() == btnSafe) {
+            ConfigStore::sanitizeImportedProfiles(imported);
+        }
+        (void)btnTrust;
     }
     int added = 0;
     m_controller->importProfiles(imported, &added);

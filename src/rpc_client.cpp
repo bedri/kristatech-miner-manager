@@ -94,7 +94,7 @@ void RpcClient::setPoolSeatsForTest(const QHash<QString, PoolSeatInfo>& seats, q
     m_lastPoolHeight = chainHeight;
     m_lastPoolFetchMs = QDateTime::currentMSecsSinceEpoch();
     for (auto it = m_targetStatuses.begin(); it != m_targetStatuses.end(); ++it) {
-        it->poolSize = m_poolSeats.size();
+        it->poolSize = static_cast<int>(m_poolSeats.size());
     }
     Q_EMIT poolSeatsUpdated();
 }
@@ -160,7 +160,7 @@ void RpcClient::refreshTargets(const QVector<WorkerProfile>& profiles)
                       st.nodeErrors = obj.value(QStringLiteral("errors")).toString().trimmed();
                       st.internalGenerate = obj.value(QStringLiteral("generate")).toBool(false);
                       st.internalThreads = obj.value(QStringLiteral("genproclimit")).toInt(0);
-                      st.poolSize = m_poolSeats.size();
+                      st.poolSize = static_cast<int>(m_poolSeats.size());
                       setTargetStatus(tkey, st);
 
                       if (p.targetType != TargetType::RemoteSsh || m_poolSeats.isEmpty()) {
@@ -215,7 +215,7 @@ void RpcClient::fetchPoolIfNeeded(const WorkerProfile& profile, const RpcCredent
                   m_lastPoolFetchMs = QDateTime::currentMSecsSinceEpoch();
 
                   for (auto it = m_targetStatuses.begin(); it != m_targetStatuses.end(); ++it) {
-                      it->poolSize = m_poolSeats.size();
+                      it->poolSize = static_cast<int>(m_poolSeats.size());
                   }
 
                   Q_EMIT poolSeatsUpdated();
@@ -328,7 +328,7 @@ void RpcClient::fetchConsensusIfNeeded(const WorkerProfile& profile,
 
 void RpcClient::probeLocalSeatOwnership(const WorkerProfile& profile, const RpcCredentials& creds, const QStringList& candidateAddrs)
 {
-    auto remaining = std::make_shared<int>(candidateAddrs.size());
+    auto remaining = std::make_shared<int>(static_cast<int>(candidateAddrs.size()));
     auto owned = std::make_shared<QVector<QPair<QString, PoolSeatInfo>>>();
 
     for (const QString& addr : candidateAddrs) {
@@ -472,7 +472,7 @@ void RpcClient::discoverLocalRegisteredSeats(const QString& confPath, std::funct
                               if (cb) cb({});
                               return;
                           }
-                          auto rem = std::make_shared<int>(addrs.size());
+                          auto rem = std::make_shared<int>(static_cast<int>(addrs.size()));
                           auto owned = std::make_shared<QVector<QString>>();
                           for (const QString& a : addrs) {
                               QJsonArray vp;
@@ -499,9 +499,14 @@ void RpcClient::invokeRpc(const WorkerProfile& profile,
                           int timeoutMs)
 {
     if (profile.targetType == TargetType::PodmanContainer) {
+        const QString podName = profile.podmanName.trimmed();
+        if (!isValidPodmanName(podName)) {
+            if (cb) cb(false, QJsonValue(), QStringLiteral("Invalid Podman container name"));
+            return;
+        }
         QStringList args{
             QStringLiteral("exec"),
-            profile.podmanName.trimmed(),
+            podName,
             QStringLiteral("/hostbin/kristatech-cli"),
             QStringLiteral("-datadir=/data"),
             method
@@ -530,6 +535,8 @@ void RpcClient::invokeRpc(const WorkerProfile& profile,
         QStringList args{
             QStringLiteral("-o"), QStringLiteral("BatchMode=yes"),
             QStringLiteral("-o"), QStringLiteral("ConnectTimeout=6"),
+            QStringLiteral("-o"), QStringLiteral("RequestTTY=no"),
+            QStringLiteral("-o"), QStringLiteral("ClearAllForwardings=yes"),
             QStringLiteral("-p"), QString::number(profile.sshPort > 0 ? profile.sshPort : 22),
             QStringLiteral("--"),
             sshTarget,
@@ -566,13 +573,55 @@ void RpcClient::invokeHttpJsonRpc(const RpcCredentials& creds,
     payload.insert(QStringLiteral("method"), method);
     payload.insert(QStringLiteral("params"), params);
 
+    static constexpr qint64 kMaxRpcResponseBytes = 16 * 1024 * 1024;
+    auto bodyBuf = std::make_shared<QByteArray>();
+    auto tooLarge = std::make_shared<bool>(false);
+
     QNetworkReply* reply = m_nam.post(req, QJsonDocument(payload).toJson(QJsonDocument::Compact));
-    connect(reply, &QNetworkReply::finished, this, [reply, cb]() {
-        const QByteArray body = reply->readAll();
+    connect(reply, &QNetworkReply::metaDataChanged, this, [reply, bodyBuf, tooLarge]() {
+        if (*tooLarge) return;
+        bool okLen = false;
+        const qint64 contentLen = reply->header(QNetworkRequest::ContentLengthHeader).toLongLong(&okLen);
+        if (okLen && contentLen > kMaxRpcResponseBytes) {
+            *tooLarge = true;
+            bodyBuf->clear();
+            reply->abort();
+        }
+    });
+    connect(reply, &QNetworkReply::readyRead, this, [reply, bodyBuf, tooLarge]() {
+        if (*tooLarge) return;
+        const qint64 remaining = kMaxRpcResponseBytes - bodyBuf->size() + 1;
+        const QByteArray chunk = reply->read(remaining);
+        if (bodyBuf->size() + chunk.size() > kMaxRpcResponseBytes) {
+            *tooLarge = true;
+            bodyBuf->clear();
+            reply->abort();
+            return;
+        }
+        bodyBuf->append(chunk);
+    });
+    connect(reply, &QNetworkReply::finished, this, [reply, bodyBuf, tooLarge, cb]() {
+        if (!*tooLarge && reply->bytesAvailable() > 0) {
+            const qint64 remaining = kMaxRpcResponseBytes - bodyBuf->size() + 1;
+            const QByteArray tail = reply->read(remaining);
+            if (bodyBuf->size() + tail.size() > kMaxRpcResponseBytes) {
+                *tooLarge = true;
+                bodyBuf->clear();
+            } else {
+                bodyBuf->append(tail);
+            }
+        }
+        const QByteArray body = *bodyBuf;
+        bodyBuf->clear();
+        const bool exceededCap = *tooLarge;
         const QNetworkReply::NetworkError netErr = reply->error();
         const QString errStr = reply->errorString();
         reply->deleteLater();
 
+        if (exceededCap) {
+            if (cb) cb(false, QJsonValue(), QStringLiteral("RPC response exceeded 16 MiB safety limit"));
+            return;
+        }
         if (netErr != QNetworkReply::NoError && body.isEmpty()) {
             if (cb) cb(false, QJsonValue(), errStr);
             return;

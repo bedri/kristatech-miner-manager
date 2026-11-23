@@ -200,7 +200,9 @@ TargetType targetTypeFromString(const QString& str);
 QString statusToKey(WorkerStatus status);
 
 bool isValidWorkerId(const QString& id);
+bool isValidPodmanName(const QString& name);
 bool isValidSshTarget(const QString& target);
+bool isExpectedMinerBinaryPath(const QString& path);
 QString normalizeRpcUrl(const QString& rawUrl);
 bool isLoopbackRpcUrl(const QString& rawUrl);
 QString sanitizeWorkerId(const QString& raw);

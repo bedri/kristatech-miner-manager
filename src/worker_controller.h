@@ -54,6 +54,9 @@ public:
 
     void clearWorkerLog(const QString& id);
 
+    /** Removes leftover runtime *.json configs in run/ that do not belong to any active worker. */
+    int cleanupOrphanedRuntimeConfigs();
+
     /** Scans live /proc processes and adopts matching workers without restarting them. */
     int adoptRunningProcesses(bool createProfilesForUnknown = true);
 

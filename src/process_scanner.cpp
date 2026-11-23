@@ -205,7 +205,7 @@ qint64 readProcParentPid(const QString& procPath)
         return 0;
     }
     const QByteArray data = f.readAll();
-    const int rparen = data.lastIndexOf(')');
+    const int rparen = static_cast<int>(data.lastIndexOf(')'));
     if (rparen < 0 || rparen + 2 >= data.size()) {
         return 0;
     }
@@ -485,7 +485,7 @@ QVector<PodmanContainerInfo> ProcessScanner::discoverPodmanContainers()
         } else if (namesVal.isString()) {
             name = namesVal.toString();
         }
-        if (name.isEmpty()) continue;
+        if (name.isEmpty() || !isValidPodmanName(name)) continue;
 
         PodmanContainerInfo info;
         info.name = name;
@@ -495,7 +495,7 @@ QVector<PodmanContainerInfo> ProcessScanner::discoverPodmanContainers()
 
         if (info.running && info.pid <= 0) {
             QProcess insp;
-            insp.start(QStringLiteral("podman"),
+            insp.start(podmanBin,
                        {QStringLiteral("inspect"), name, QStringLiteral("--format"), QStringLiteral("{{.State.Pid}}")});
             if (insp.waitForFinished(3000) && insp.exitCode() == 0) {
                 info.pid = QString::fromUtf8(insp.readAllStandardOutput()).trimmed().toLongLong();
@@ -601,7 +601,7 @@ QVector<DiscoveredProcess> ProcessScanner::scanRunningMiners()
         const QString base0 = QFileInfo(rp.args.first()).fileName();
         if (base0 == QStringLiteral("podman") && rp.args.contains(QStringLiteral("nsenter"))) {
             podmanWrapperPids.insert(pid);
-            const int tIdx = rp.args.indexOf(QStringLiteral("-t"));
+            const int tIdx = static_cast<int>(rp.args.indexOf(QStringLiteral("-t")));
             if (tIdx >= 0 && tIdx + 1 < rp.args.size()) {
                 const qint64 targetPodPid = rp.args[tIdx + 1].toLongLong();
                 if (containerPidToName.contains(targetPodPid)) {
@@ -710,6 +710,40 @@ bool ProcessScanner::isPidAlive(qint64 pid)
         return true;
     }
     return errno == EPERM;
+#endif
+}
+
+bool ProcessScanner::isManagedMinerOrWrapperPid(qint64 pid)
+{
+    if (pid <= 1) {
+        return false;
+    }
+#ifdef Q_OS_WIN
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
+    if (!hProc) {
+        return false;
+    }
+    wchar_t buf[32768];
+    DWORD sz = static_cast<DWORD>(sizeof(buf) / sizeof(buf[0]));
+    QString exePath;
+    if (QueryFullProcessImageNameW(hProc, 0, buf, &sz)) {
+        exePath = QString::fromWCharArray(buf, static_cast<int>(sz));
+    }
+    CloseHandle(hProc);
+    return !exePath.isEmpty() && isMinerExeBase(normalizeExeNameLower(exePath));
+#else
+    const QStringList args = readProcCmdline(QStringLiteral("/proc/%1").arg(pid));
+    if (args.isEmpty()) {
+        return false;
+    }
+    const QString base = normalizeExeNameLower(args.first());
+    if (isMinerExeBase(base) || base == QStringLiteral("taskset")) {
+        return true;
+    }
+    if (base == QStringLiteral("podman") && args.contains(QStringLiteral("nsenter"))) {
+        return true;
+    }
+    return false;
 #endif
 }
 

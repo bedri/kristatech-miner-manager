@@ -4,7 +4,23 @@
 
 #include <QByteArray>
 #include <QString>
+#include <QStringList>
 #include <QVector>
+
+struct ImportSecurityReport {
+    int customBinaryCount{0};
+    int extraArgsCount{0};
+    int customConfCount{0};
+    int plaintextRemoteHttpCount{0};
+    int sshCount{0};
+    QStringList flaggedDetails;
+
+    bool hasRiskyFields() const
+    {
+        return customBinaryCount > 0 || extraArgsCount > 0 || customConfCount > 0
+            || plaintextRemoteHttpCount > 0 || sshCount > 0;
+    }
+};
 
 /**
  * Handles secure profile persistence, .conf credential parsing,
@@ -31,6 +47,8 @@ public:
 
     QByteArray exportProfilesJson(const QVector<WorkerProfile>& profiles, bool redactSecrets = true) const;
     QVector<WorkerProfile> parseImportedProfilesJson(const QByteArray& data, QString* errorOut = nullptr) const;
+    static ImportSecurityReport inspectImportedProfiles(const QVector<WorkerProfile>& profiles);
+    static void sanitizeImportedProfiles(QVector<WorkerProfile>& profiles);
 
     /** Platform-appropriate default path to kristatech.conf. */
     static QString defaultKristaTechConfPath();

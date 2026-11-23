@@ -283,6 +283,7 @@ WorkerDialog::WorkerDialog(const WorkerProfile* existingProfile,
     connect(m_comboTarget, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &WorkerDialog::onTargetTypeChanged);
     connect(m_comboPodman, &QComboBox::currentTextChanged, this, &WorkerDialog::onPodmanSelectionChanged);
     connect(m_comboAddress, &QComboBox::currentTextChanged, this, &WorkerDialog::onAddressChanged);
+    connect(m_editRpcUrl, &QLineEdit::textChanged, this, [this]() { validateAddressWarning(); });
     connect(m_btnBrowseBin, &QPushButton::clicked, this, &WorkerDialog::onBrowseBinary);
     connect(m_btnTestBin, &QPushButton::clicked, this, &WorkerDialog::onTestBinary);
     connect(btnCancel, &QPushButton::clicked, this, &QDialog::reject);
@@ -318,7 +319,7 @@ QString WorkerDialog::extractedCoinbaseAddress() const
         const QString dataAddr = m_comboAddress->itemData(curIdx).toString().trimmed();
         if (!dataAddr.isEmpty()) return dataAddr;
     }
-    const int spacePos = text.indexOf(QLatin1Char(' '));
+    const int spacePos = static_cast<int>(text.indexOf(QLatin1Char(' ')));
     return (spacePos > 0) ? text.left(spacePos).trimmed() : text;
 }
 
@@ -337,6 +338,7 @@ void WorkerDialog::onEngineChanged(int)
 void WorkerDialog::onTargetTypeChanged(int)
 {
     updateVisibilityForEngineAndTarget();
+    validateAddressWarning();
 }
 
 void WorkerDialog::onPodmanSelectionChanged(const QString& podName)
@@ -362,23 +364,33 @@ void WorkerDialog::onAddressChanged(const QString&)
 
 void WorkerDialog::validateAddressWarning()
 {
-    if (!m_rpc) {
-        m_warnFrame->setVisible(false);
-        return;
+    QStringList warnings;
+    const TargetType tgt = static_cast<TargetType>(m_comboTarget->currentData().toInt());
+    if (tgt == TargetType::CustomRpc) {
+        const QString normUrl = normalizeRpcUrl(m_editRpcUrl->text());
+        if (!normUrl.isEmpty()
+            && normUrl.startsWith(QStringLiteral("http://"), Qt::CaseInsensitive)
+            && !isLoopbackRpcUrl(normUrl)) {
+            warnings.append(KTr(QStringLiteral("dlg.insecure_http_warn")));
+        }
     }
-    const QString addr = extractedCoinbaseAddress();
-    if (addr.isEmpty()) {
-        m_warnFrame->setVisible(false);
-        return;
+
+    if (m_rpc) {
+        const QString addr = extractedCoinbaseAddress();
+        if (!addr.isEmpty()) {
+            const PoolSeatInfo seat = m_rpc->seatInfoForAddress(addr);
+            if (seat.known && !seat.registered) {
+                warnings.append(KTr(QStringLiteral("dlg.unreg_warn")));
+            } else if (seat.isExpiringSoon(m_rpc->consensusStatus().chain)) {
+                warnings.append(KTr(QStringLiteral("dlg.expiring_warn"))
+                                    .arg(seat.track)
+                                    .arg(seat.remainingBlocks));
+            }
+        }
     }
-    const PoolSeatInfo seat = m_rpc->seatInfoForAddress(addr);
-    if (seat.known && !seat.registered) {
-        m_warnLabel->setText(KTr(QStringLiteral("dlg.unreg_warn")));
-        m_warnFrame->setVisible(true);
-    } else if (seat.isExpiringSoon(m_rpc->consensusStatus().chain)) {
-        m_warnLabel->setText(KTr(QStringLiteral("dlg.expiring_warn"))
-                                 .arg(seat.track)
-                                 .arg(seat.remainingBlocks));
+
+    if (!warnings.isEmpty()) {
+        m_warnLabel->setText(warnings.join(QLatin1Char('\n')));
         m_warnFrame->setVisible(true);
     } else {
         m_warnFrame->setVisible(false);
@@ -437,6 +449,16 @@ void WorkerDialog::onBrowseConf()
 void WorkerDialog::onTestBinary()
 {
     const QString exe = m_editBinary->text().trimmed();
+    if (exe.isEmpty()) {
+        return;
+    }
+    if (!isExpectedMinerBinaryPath(exe)) {
+        if (QMessageBox::question(this,
+                                  KTr(QStringLiteral("dlg.test_bin_confirm_title")),
+                                  KTr(QStringLiteral("dlg.test_bin_confirm_msg")).arg(exe)) != QMessageBox::Yes) {
+            return;
+        }
+    }
     QProcess p;
     p.start(exe, {QStringLiteral("--version")});
     if (!p.waitForFinished(4000)) {
@@ -455,6 +477,10 @@ void WorkerDialog::onAcceptClicked()
         return;
     }
     const TargetType tgt = static_cast<TargetType>(m_comboTarget->currentData().toInt());
+    if (tgt == TargetType::PodmanContainer && !isValidPodmanName(m_comboPodman->currentText().trimmed())) {
+        QMessageBox::warning(this, windowTitle(), KTr(QStringLiteral("dlg.invalid_podman")));
+        return;
+    }
     if (tgt == TargetType::RemoteSsh && !isValidSshTarget(m_editSshTarget->text().trimmed())) {
         QMessageBox::warning(this, windowTitle(), QStringLiteral("Invalid SSH User@Host target."));
         return;
