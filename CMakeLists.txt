@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(kristatech-miner-manager VERSION 1.0.0 LANGUAGES CXX)
+project(kristatech-miner-manager VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -31,6 +31,10 @@ add_library(kmm_core STATIC
     src/process_scanner.cpp
     src/worker_controller.h
     src/worker_controller.cpp
+)
+
+target_compile_definitions(kmm_core PUBLIC
+    KMM_APP_VERSION="${PROJECT_VERSION}"
 )
 
 target_include_directories(kmm_core PUBLIC

@@ -80,6 +80,11 @@ struct PoolSeatInfo {
     qint64 unlockHeight{0};
     qint64 remainingBlocks{0};
     qint64 chainHeight{0};
+
+    bool hasExpiry() const;
+    qint64 renewalThresholdBlocks(const QString& chain = QString()) const;
+    bool isExpiringSoon(const QString& chain = QString()) const;
+    bool isRenewableTrack() const;
 };
 
 struct NodeMiningStatus {
@@ -90,7 +95,28 @@ struct NodeMiningStatus {
     bool internalGenerate{false};
     int internalThreads{0};
     double networkHashPs{0.0};
+    double difficulty{0.0};
+    QString chain;
+    QString nodeErrors;
+    bool walletChecked{false};
+    bool walletEncrypted{false};
+    bool walletLocked{false};
+    qint64 walletUnlockedUntil{0};
+    bool initialBlockDownload{false};
     QString error;
+};
+
+struct ConsensusStatus {
+    bool known{false};
+    QString chain;
+    bool initialBlockDownload{false};
+    bool fairnessActive{false};
+    bool modelDActive{false};
+    bool openEntryActive{false};
+    bool pomblActive{false};
+    QStringList activeUpgrades;
+
+    QString badgeLabel() const;
 };
 
 struct GpuTelemetry {
@@ -148,6 +174,8 @@ struct WorkerRuntime {
 
     bool warningDeferred{false};
     QString warningDeferredMsg;
+    bool warningWalletLocked{false};
+    QString warningWalletLockedMsg;
     bool warningRpcError{false};
     QString warningRpcErrorMsg;
     QString lastError;
@@ -177,8 +205,10 @@ QString normalizeRpcUrl(const QString& rawUrl);
 bool isLoopbackRpcUrl(const QString& rawUrl);
 QString sanitizeWorkerId(const QString& raw);
 QString formatHashrateKhs(double khs);
+QString formatSeatTrackBadge(const PoolSeatInfo& seat);
 
 Q_DECLARE_METATYPE(WorkerProfile)
 Q_DECLARE_METATYPE(PoolSeatInfo)
 Q_DECLARE_METATYPE(NodeMiningStatus)
+Q_DECLARE_METATYPE(ConsensusStatus)
 Q_DECLARE_METATYPE(GpuTelemetry)

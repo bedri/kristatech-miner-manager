@@ -63,6 +63,7 @@ private Q_SLOTS:
     void onAutoStopDeferredToggled(bool enabled);
     void onFilterChanged();
     void onRowSelectionChanged();
+    void onRenewSelectedSeat();
     void requestQuit();
 
 private:
@@ -167,6 +168,8 @@ private:
     QFrame* m_warnBanner{nullptr};
     QLabel* m_lblWarnBanner{nullptr};
     QPushButton* m_btnFixDoubleMine{nullptr};
+    QPushButton* m_btnRenewSeat{nullptr};
+    QSet<QString> m_renewingWorkers;
     QPushButton* m_btnCopyAddr{nullptr};
     QPushButton* m_btnClearLog{nullptr};
     QCheckBox* m_chkAutoScroll{nullptr};

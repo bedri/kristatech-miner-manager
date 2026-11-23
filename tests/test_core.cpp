@@ -38,6 +38,7 @@ private Q_SLOTS:
     void testAutoReattachStalePodmanNetNs();
     void testCustomRpcLifecycleAndJsonRpc();
     void testRemoteSshLifecycleAndHealthCheck();
+    void testKristaFairnessRpcAndSeatExpiry();
 };
 
 void TestCore::testParseKristaTechConf()
@@ -1208,6 +1209,272 @@ void TestCore::testRemoteSshLifecycleAndHealthCheck()
 #else
     QSKIP("POSIX fake SSH harness test skipped on Windows");
 #endif
+}
+
+void TestCore::testKristaFairnessRpcAndSeatExpiry()
+{
+    // 1. Seat expiry & track badge rules aligned to KRISTA v1.5.9.0 / UPGRADE_FAIRNESS
+    PoolSeatInfo mnSeat{true, true, QStringLiteral("masternode"), 0, 0, 9000};
+    QVERIFY(!mnSeat.hasExpiry());
+    QCOMPARE(mnSeat.renewalThresholdBlocks(QStringLiteral("main")), qint64(0));
+    QVERIFY(!mnSeat.isExpiringSoon(QStringLiteral("main")));
+    QVERIFY(!mnSeat.isRenewableTrack());
+    QCOMPARE(formatSeatTrackBadge(mnSeat), QStringLiteral("masternode"));
+
+    PoolSeatInfo bsSeat{true, true, QStringLiteral("bootstrap"), 0, 0, 9000};
+    QVERIFY(!bsSeat.hasExpiry());
+    QVERIFY(!bsSeat.isExpiringSoon(QStringLiteral("main")));
+    QCOMPARE(formatSeatTrackBadge(bsSeat), QStringLiteral("bootstrap"));
+
+    PoolSeatInfo clExpiring{true, true, QStringLiteral("coin_lock"), 9240, 240, 9000};
+    QVERIFY(clExpiring.hasExpiry());
+    QCOMPARE(clExpiring.renewalThresholdBlocks(QStringLiteral("main")), qint64(240));
+    QVERIFY(clExpiring.isExpiringSoon(QStringLiteral("main")));
+    QVERIFY(clExpiring.isRenewableTrack());
+    QCOMPARE(formatSeatTrackBadge(clExpiring), QStringLiteral("coin_lock (240b)"));
+
+    PoolSeatInfo clHealthy{true, true, QStringLiteral("coin_lock"), 9241, 241, 9000};
+    QVERIFY(!clHealthy.isExpiringSoon(QStringLiteral("main")));
+
+    PoolSeatInfo powTest{true, true, QStringLiteral("pow_lock"), 9015, 15, 9000};
+    QVERIFY(powTest.isExpiringSoon(QStringLiteral("test")));
+    PoolSeatInfo powTestHealthy{true, true, QStringLiteral("pow_lock"), 9016, 16, 9000};
+    QVERIFY(!powTestHealthy.isExpiringSoon(QStringLiteral("test")));
+
+    PoolSeatInfo zeroExpiring{true, true, QStringLiteral("zerocoin_pow"), 9024, 24, 9000};
+    QVERIFY(zeroExpiring.isExpiringSoon(QStringLiteral("main")));
+    const PoolSeatInfo zeroHealthy{true, true, QStringLiteral("zerocoin_pow"), 9025, 25, 9000};
+    QVERIFY(!zeroHealthy.isExpiringSoon(QStringLiteral("main")));
+    const PoolSeatInfo zeroRegExpiring{true, true, QStringLiteral("zerocoin_pow"), 9008, 8, 9000};
+    QVERIFY(zeroRegExpiring.isExpiringSoon(QStringLiteral("regtest")));
+    const PoolSeatInfo zeroRegHealthy{true, true, QStringLiteral("zerocoin_pow"), 9009, 9, 9000};
+    QVERIFY(!zeroRegHealthy.isExpiringSoon(QStringLiteral("regtest")));
+
+    // 2. Log parser fixes for ccminer election wait, auto-register clear, and locked wallet detection
+    WorkerRuntime rt;
+    rt.status = WorkerStatus::Solving;
+    WorkerController::parseLogLine(
+        QStringLiteral("[2026-11-22 10:00:00] ADAM miner: Waiting for election (our miner is not elected for the current block)"),
+        rt);
+    QCOMPARE(rt.status, WorkerStatus::Waiting);
+
+    WorkerController::parseLogLine(
+        QStringLiteral("[2026-11-22 10:00:05] ADAM Auto-Register deferred: Error: Please enter the wallet passphrase with walletpassphrase first."),
+        rt);
+    QVERIFY(rt.warningDeferred);
+    QVERIFY(rt.warningWalletLocked);
+
+    WorkerController::parseLogLine(
+        QStringLiteral("[2026-11-22 10:00:10] ADAM Auto-Register: Successfully registered miner! TxID: deadbeef1234"),
+        rt);
+    QVERIFY(!rt.warningDeferred);
+    QVERIFY(!rt.warningWalletLocked);
+
+    rt.warningDeferred = true;
+    WorkerController::parseLogLine(
+        QStringLiteral("[2026-11-22 10:00:12] ADAM Auto-Register: A PoW-Lock registration is pending in mempool (waiting for block #9001)"),
+        rt);
+    QVERIFY(!rt.warningDeferred);
+
+    // 3. Mock KRISTA v1.5.9.0 HTTP JSON-RPC node for getwalletinfo, getblockchaininfo, getadamminers, registerminer
+    QTcpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+    const quint16 port = server.serverPort();
+
+    enum class WalletMockMode { Locked, Unlocked, Unencrypted };
+    WalletMockMode walletMode = WalletMockMode::Locked;
+    QList<QPair<QString, QJsonArray>> registerCalls;
+    QHash<QTcpSocket*, QByteArray> buffers;
+
+    QObject::connect(&server, &QTcpServer::newConnection, &server, [&]() {
+        while (QTcpSocket* sock = server.nextPendingConnection()) {
+            QObject::connect(sock, &QTcpSocket::disconnected, sock, [sock, &buffers]() {
+                buffers.remove(sock);
+                sock->deleteLater();
+            });
+            QObject::connect(sock, &QTcpSocket::readyRead, sock, [sock, &buffers, &walletMode, &registerCalls]() {
+                QByteArray& buf = buffers[sock];
+                buf.append(sock->readAll());
+                const int hdrEnd = buf.indexOf("\r\n\r\n");
+                if (hdrEnd < 0) return;
+                const QByteArray hdrs = buf.left(hdrEnd);
+                int contentLen = 0;
+                for (const QByteArray& line : hdrs.split('\n')) {
+                    const QByteArray trimmedLine = line.trimmed();
+                    if (trimmedLine.toLower().startsWith("content-length:")) {
+                        contentLen = trimmedLine.mid(15).trimmed().toInt();
+                    }
+                }
+                if (buf.size() < hdrEnd + 4 + contentLen) return;
+                const QByteArray body = buf.mid(hdrEnd + 4, contentLen);
+                buf.clear();
+
+                const QJsonObject reqObj = QJsonDocument::fromJson(body).object();
+                const QString method = reqObj.value(QStringLiteral("method")).toString();
+                const QJsonArray params = reqObj.value(QStringLiteral("params")).toArray();
+
+                QJsonObject respObj;
+                respObj.insert(QStringLiteral("id"), reqObj.value(QStringLiteral("id")));
+                respObj.insert(QStringLiteral("error"), QJsonValue::Null);
+
+                if (method == QStringLiteral("getmininginfo")) {
+                    QJsonObject res;
+                    res.insert(QStringLiteral("blocks"), 9000);
+                    res.insert(QStringLiteral("difficulty"), 0.0025);
+                    res.insert(QStringLiteral("errors"), QStringLiteral(""));
+                    res.insert(QStringLiteral("networkhashps"), 55555.0);
+                    res.insert(QStringLiteral("chain"), QStringLiteral("main"));
+                    res.insert(QStringLiteral("generate"), false);
+                    res.insert(QStringLiteral("genproclimit"), 0);
+                    respObj.insert(QStringLiteral("result"), res);
+                } else if (method == QStringLiteral("getwalletinfo")) {
+                    QJsonObject res;
+                    res.insert(QStringLiteral("walletversion"), 15900);
+                    res.insert(QStringLiteral("balance"), 500.0);
+                    if (walletMode == WalletMockMode::Locked) {
+                        res.insert(QStringLiteral("unlocked_until"), 0);
+                    } else if (walletMode == WalletMockMode::Unlocked) {
+                        res.insert(QStringLiteral("unlocked_until"), 1899999999);
+                    }
+                    respObj.insert(QStringLiteral("result"), res);
+                } else if (method == QStringLiteral("getblockchaininfo")) {
+                    QJsonObject upFairness{{QStringLiteral("activationheight"), 1}, {QStringLiteral("status"), QStringLiteral("active")}};
+                    QJsonObject upModelD{{QStringLiteral("activationheight"), 1}, {QStringLiteral("status"), QStringLiteral("active")}};
+                    QJsonObject upOpen{{QStringLiteral("activationheight"), 2500}, {QStringLiteral("status"), QStringLiteral("active")}};
+                    QJsonObject upTreas{{QStringLiteral("activationheight"), 999999}, {QStringLiteral("status"), QStringLiteral("defined")}};
+                    QJsonObject upgrades;
+                    upgrades.insert(QStringLiteral("Fairness"), upFairness);
+                    upgrades.insert(QStringLiteral("Model D"), upModelD);
+                    upgrades.insert(QStringLiteral("ADAM Open Entry"), upOpen);
+                    upgrades.insert(QStringLiteral("Treasury Governance"), upTreas);
+
+                    QJsonObject res;
+                    res.insert(QStringLiteral("chain"), QStringLiteral("main"));
+                    res.insert(QStringLiteral("blocks"), 9000);
+                    res.insert(QStringLiteral("initialblockdownload"), false);
+                    res.insert(QStringLiteral("upgrades"), upgrades);
+                    respObj.insert(QStringLiteral("result"), res);
+                } else if (method == QStringLiteral("getadamminers")) {
+                    QJsonArray arr;
+                    arr.append(QJsonObject{{QStringLiteral("address"), QStringLiteral("KTMn000000000000000000000000000001")},
+                                           {QStringLiteral("track"), QStringLiteral("masternode")},
+                                           {QStringLiteral("unlock_height"), 0}});
+                    arr.append(QJsonObject{{QStringLiteral("address"), QStringLiteral("KTCl000000000000000000000000000002")},
+                                           {QStringLiteral("track"), QStringLiteral("coin_lock")},
+                                           {QStringLiteral("unlock_height"), 9150}});
+                    arr.append(QJsonObject{{QStringLiteral("address"), QStringLiteral("KTPw000000000000000000000000000003")},
+                                           {QStringLiteral("track"), QStringLiteral("pow_lock")},
+                                           {QStringLiteral("unlock_height"), 11000}});
+                    arr.append(QJsonObject{{QStringLiteral("address"), QStringLiteral("KTZr000000000000000000000000000004")},
+                                           {QStringLiteral("track"), QStringLiteral("zerocoin_pow")},
+                                           {QStringLiteral("unlock_height"), 9018}});
+                    respObj.insert(QStringLiteral("result"), arr);
+                } else if (method == QStringLiteral("registerminer")) {
+                    registerCalls.append({params.at(0).toString(), params});
+                    respObj.insert(QStringLiteral("result"),
+                                   params.at(0).toString() == QStringLiteral("lock")
+                                       ? QStringLiteral("tx_renew_lock_001")
+                                       : QStringLiteral("tx_renew_pow_002"));
+                }
+
+                const QByteArray payload = QJsonDocument(respObj).toJson(QJsonDocument::Compact);
+                const QByteArray resp =
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: " + QByteArray::number(payload.size()) + "\r\n"
+                    "Connection: close\r\n\r\n" + payload;
+                sock->write(resp);
+                sock->disconnectFromHost();
+            });
+        }
+    });
+
+    RpcClient rpc;
+    WorkerProfile p;
+    p.id = QStringLiteral("fairness_rpc");
+    p.name = QStringLiteral("Fairness RPC");
+    p.targetType = TargetType::CustomRpc;
+    p.rpcUrl = QStringLiteral("127.0.0.1:%1").arg(port);
+    p.rpcUser = QStringLiteral("u");
+    p.rpcPassword = QStringLiteral("p");
+    p.coinbaseAddress = QStringLiteral("KTCl000000000000000000000000000002");
+
+    rpc.refreshTargets({p});
+    QTRY_VERIFY_WITH_TIMEOUT(
+        rpc.statusForTarget(p.targetKey()).walletChecked
+        && rpc.consensusStatus().known
+        && rpc.allKnownSeats().size() == 4,
+        4000);
+
+    NodeMiningStatus st = rpc.statusForTarget(p.targetKey());
+    QCOMPARE(st.chain, QStringLiteral("main"));
+    QVERIFY(st.walletEncrypted);
+    QVERIFY(st.walletLocked);
+    QCOMPARE(st.walletUnlockedUntil, qint64(0));
+
+    const ConsensusStatus cs = rpc.consensusStatus();
+    QVERIFY(cs.fairnessActive);
+    QVERIFY(cs.modelDActive);
+    QVERIFY(cs.openEntryActive);
+    QCOMPARE(cs.badgeLabel(), QStringLiteral("Fairness"));
+    QVERIFY(cs.activeUpgrades.contains(QStringLiteral("Fairness")));
+    QVERIFY(!cs.activeUpgrades.contains(QStringLiteral("Treasury Governance")));
+
+    QVERIFY(!rpc.seatInfoForAddress(QStringLiteral("KTMn000000000000000000000000000001")).isExpiringSoon(st.chain));
+    QVERIFY(rpc.seatInfoForAddress(QStringLiteral("KTCl000000000000000000000000000002")).isExpiringSoon(st.chain));
+    QVERIFY(!rpc.seatInfoForAddress(QStringLiteral("KTPw000000000000000000000000000003")).isExpiringSoon(st.chain));
+    QVERIFY(rpc.seatInfoForAddress(QStringLiteral("KTZr000000000000000000000000000004")).isExpiringSoon(st.chain));
+
+    // Flip to Unlocked
+    walletMode = WalletMockMode::Unlocked;
+    rpc.refreshTargets({p});
+    QTRY_VERIFY_WITH_TIMEOUT(!rpc.statusForTarget(p.targetKey()).walletLocked, 4000);
+    st = rpc.statusForTarget(p.targetKey());
+    QVERIFY(st.walletEncrypted);
+    QVERIFY(!st.walletLocked);
+    QCOMPARE(st.walletUnlockedUntil, qint64(1899999999));
+
+    // Flip to Unencrypted
+    walletMode = WalletMockMode::Unencrypted;
+    rpc.refreshTargets({p});
+    QTRY_VERIFY_WITH_TIMEOUT(!rpc.statusForTarget(p.targetKey()).walletEncrypted, 4000);
+    st = rpc.statusForTarget(p.targetKey());
+    QVERIFY(st.walletChecked);
+    QVERIFY(!st.walletEncrypted);
+    QVERIFY(!st.walletLocked);
+
+    // Seat renewal RPC parameter verification
+    bool lockDone = false, lockOk = false;
+    QString lockTx;
+    rpc.renewMinerSeat(p, QStringLiteral("coin_lock"), QStringLiteral("KTCl000000000000000000000000000002"), 9000,
+                       [&](bool ok, const QString& tx) {
+                           lockDone = true;
+                           lockOk = ok;
+                           lockTx = tx;
+                       });
+    QTRY_VERIFY_WITH_TIMEOUT(lockDone, 4000);
+    QVERIFY(lockOk);
+    QCOMPARE(lockTx, QStringLiteral("tx_renew_lock_001"));
+
+    bool powDone = false, powOk = false;
+    QString powTx;
+    rpc.renewMinerSeat(p, QStringLiteral("pow_lock"), QStringLiteral("KTPw000000000000000000000000000003"), 9000,
+                       [&](bool ok, const QString& tx) {
+                           powDone = true;
+                           powOk = ok;
+                           powTx = tx;
+                       });
+    QTRY_VERIFY_WITH_TIMEOUT(powDone, 4000);
+    QVERIFY(powOk);
+    QCOMPARE(powTx, QStringLiteral("tx_renew_pow_002"));
+
+    QCOMPARE(registerCalls.size(), 2);
+    QCOMPARE(registerCalls[0].second.at(0).toString(), QStringLiteral("lock"));
+    QCOMPARE(static_cast<qint64>(registerCalls[0].second.at(1).toDouble()), qint64(11900));
+    QCOMPARE(registerCalls[0].second.at(2).toString(), QStringLiteral("KTCl000000000000000000000000000002"));
+    QCOMPARE(registerCalls[1].second.at(0).toString(), QStringLiteral("pow"));
+    QCOMPARE(registerCalls[1].second.at(1).toString(), QStringLiteral(""));
+    QCOMPARE(registerCalls[1].second.at(2).toString(), QStringLiteral("KTPw000000000000000000000000000003"));
 }
 
 QTEST_MAIN(TestCore)

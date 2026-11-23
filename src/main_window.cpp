@@ -101,6 +101,7 @@ MainWindow::MainWindow(ConfigStore* store,
     connect(m_controller, &WorkerController::workersChanged, this, &MainWindow::refreshTableAndKpis);
     connect(m_controller, &WorkerController::workerLogAppended, this, &MainWindow::onWorkerLogAppended);
     connect(m_rpc, &RpcClient::targetStatusUpdated, this, [this]() { refreshTableAndKpis(); });
+    connect(m_rpc, &RpcClient::consensusStatusUpdated, this, [this]() { refreshTableAndKpis(); });
     connect(m_rpc, &RpcClient::poolSeatsUpdated, this, [this]() { refreshTableAndKpis(); });
 
     new QShortcut(QKeySequence::Quit, this, SLOT(requestQuit()));
@@ -326,8 +327,15 @@ void MainWindow::setupUi()
     m_btnFixDoubleMine = new QPushButton(m_warnBanner);
     m_btnFixDoubleMine->setProperty("variant", QStringLiteral("salmon"));
     m_btnFixDoubleMine->setFocusPolicy(Qt::NoFocus);
+    m_btnRenewSeat = new QPushButton(m_warnBanner);
+    m_btnRenewSeat->setObjectName(QStringLiteral("btnRenewSeat"));
+    m_btnRenewSeat->setProperty("variant", QStringLiteral("primary"));
+    m_btnRenewSeat->setCursor(Qt::PointingHandCursor);
+    m_btnRenewSeat->setFocusPolicy(Qt::NoFocus);
+    m_btnRenewSeat->setVisible(false);
     wbLay->addWidget(m_lblWarnBanner, 1);
     wbLay->addWidget(m_btnFixDoubleMine);
+    wbLay->addWidget(m_btnRenewSeat);
     m_warnBanner->setVisible(false);
     inspLay->addWidget(m_warnBanner);
 
@@ -410,6 +418,7 @@ void MainWindow::setupUi()
             }
         });
     });
+    connect(m_btnRenewSeat, &QPushButton::clicked, this, &MainWindow::onRenewSelectedSeat);
 }
 
 void MainWindow::setupTray()
@@ -503,6 +512,10 @@ void MainWindow::retranslateUi()
     m_btnClearLog->setText(KTr(QStringLiteral("log.clear")));
     m_chkAutoScroll->setText(KTr(QStringLiteral("log.autoscroll")));
     m_btnFixDoubleMine->setText(KTr(QStringLiteral("btn.fix_disable_gen")));
+    if (m_btnRenewSeat) {
+        const bool renewing = !m_selectedWorkerId.isEmpty() && m_renewingWorkers.contains(m_selectedWorkerId);
+        m_btnRenewSeat->setText(KTr(renewing ? QStringLiteral("btn.renewing_seat") : QStringLiteral("btn.renew_seat")));
+    }
 
     if (m_tray) {
         m_tray->setToolTip(KTr(QStringLiteral("app.title")));
@@ -764,11 +777,13 @@ void MainWindow::rebuildTable()
     const int toggleBtnW = qMax(startW, stopW) + 28; // 20px QSS padding + 2px border + cushion
     const int editBtnW = editW + 28;
 
+    const ConsensusStatus consensus = m_rpc->consensusStatus();
     for (int r = 0; r < profiles.size(); ++r) {
         const WorkerProfile& p = profiles[r];
         const WorkerRuntime rt = m_controller->runtimeById(p.id);
         const PoolSeatInfo seat = m_rpc->seatInfoForAddress(p.coinbaseAddress);
         const NodeMiningStatus nodeSt = m_rpc->statusForTarget(p.targetKey());
+        const QString chain = !nodeSt.chain.isEmpty() ? nodeSt.chain : consensus.chain;
 
         const bool isRunning = (rt.pid > 0 && rt.status != WorkerStatus::Stopped && rt.status != WorkerStatus::Error) ||
                                rt.status == WorkerStatus::Restarting || rt.status == WorkerStatus::Starting;
@@ -776,8 +791,12 @@ void MainWindow::rebuildTable()
         const bool rpcOfflineWarn = nodeSt.checked && !nodeSt.reachable;
         const bool missingAddrWarn = p.coinbaseAddress.isEmpty();
         const bool statusErrWarn = (rt.status == WorkerStatus::Error);
+        const bool walletLockedWarn = (nodeSt.reachable && nodeSt.walletLocked) || rt.warningWalletLocked;
+        const bool expiringWarn = seat.isExpiringSoon(chain);
+        const bool nodeAlertWarn = nodeSt.reachable && !nodeSt.nodeErrors.isEmpty();
         const bool hasWarn = unregWarn || rt.warningDeferred || rt.warningRpcError ||
-                             rpcOfflineWarn || missingAddrWarn || statusErrWarn;
+                             rpcOfflineWarn || missingAddrWarn || statusErrWarn ||
+                             walletLockedWarn || expiringWarn || nodeAlertWarn;
 
         // Col 0: Worker Name + Search blob + filter user data
         QTableWidgetItem* itName = new NumericSortItem(p.name);
@@ -827,9 +846,17 @@ void MainWindow::rebuildTable()
 
         // Col 4: ADAM Pool Status
         QString poolText;
+        QString poolTip;
         QColor poolColor(tc.textSecondary);
         if (p.coinbaseAddress.isEmpty()) {
             poolText = QStringLiteral("—");
+        } else if (walletLockedWarn) {
+            poolText = QStringLiteral("🔒 ") + KTr(QStringLiteral("pool.wallet_locked"));
+            poolColor = QColor(tc.dangerFg);
+            poolTip = KTr(QStringLiteral("warn.wallet_locked_banner"));
+            if (seat.registered) {
+                poolTip += QStringLiteral("\n") + formatSeatTrackBadge(seat);
+            }
         } else if (rt.warningDeferred) {
             poolText = QStringLiteral("⚠ ") + KTr(QStringLiteral("pool.deferred"));
             poolColor = QColor(tc.warnFg);
@@ -839,17 +866,37 @@ void MainWindow::rebuildTable()
         } else if (!seat.known) {
             poolText = KTr(QStringLiteral("pool.checking"));
         } else if (seat.registered) {
-            poolText = QStringLiteral("✓ %1 (%2b)")
-                .arg(seat.track)
-                .arg(seat.remainingBlocks);
-            poolColor = QColor(tc.successFg);
+            const QString badge = formatSeatTrackBadge(seat);
+            const qint64 approxMin = qMax<qint64>(1, (seat.remainingBlocks * 30 + 30) / 60);
+            if (expiringWarn) {
+                poolText = QStringLiteral("⚠ ") + badge;
+                poolColor = QColor(tc.warnFg);
+                poolTip = KTr(QStringLiteral("pool.expiring_tip"))
+                    .arg(seat.track)
+                    .arg(seat.remainingBlocks)
+                    .arg(approxMin)
+                    .arg(seat.renewalThresholdBlocks(chain));
+            } else {
+                poolText = QStringLiteral("✓ ") + badge;
+                poolColor = QColor(tc.successFg);
+                poolTip = seat.hasExpiry()
+                    ? KTr(QStringLiteral("pool.active_tip"))
+                          .arg(seat.track)
+                          .arg(seat.remainingBlocks)
+                          .arg(approxMin)
+                          .arg(seat.renewalThresholdBlocks(chain))
+                    : KTr(QStringLiteral("pool.permanent_tip")).arg(seat.track);
+            }
         } else {
             poolText = QStringLiteral("⚠ ") + KTr(QStringLiteral("pool.unregistered"));
             poolColor = QColor(tc.dangerFg);
         }
         QTableWidgetItem* itPool = new NumericSortItem(poolText);
+        if (!poolTip.isEmpty()) {
+            itPool->setToolTip(poolTip);
+        }
         itPool->setForeground(poolColor);
-        itPool->setData(Qt::UserRole + 10, seat.registered ? 2 : (seat.known ? 0 : 1));
+        itPool->setData(Qt::UserRole + 10, walletLockedWarn ? -1 : (seat.registered ? (expiringWarn ? 1 : 3) : (seat.known ? 0 : 2)));
         m_table->setItem(r, 4, itPool);
 
         // Col 5: Runtime State
@@ -1072,12 +1119,32 @@ void MainWindow::updateKpis()
     int gpuCount = 0;
     int regCount = 0;
     int unregWasteCount = 0;
+    int expiringSeats = 0;
     double sumKhs = 0.0;
     int sumAcc = 0, sumStale = 0, sumRej = 0;
 
     qint64 bestHeight = 0;
-    int poolSize = m_rpc->allKnownSeats().size();
+    const auto knownSeats = m_rpc->allKnownSeats();
+    int poolSize = knownSeats.size();
+    int mnCount = 0;
+    int clCount = 0;
+    int powCount = 0;
+    int zeroCount = 0;
+    for (auto it = knownSeats.constBegin(); it != knownSeats.constEnd(); ++it) {
+        const QString& trk = it.value().track;
+        if (trk == QStringLiteral("masternode")) ++mnCount;
+        else if (trk == QStringLiteral("coin_lock")) ++clCount;
+        else if (trk == QStringLiteral("pow_lock")) ++powCount;
+        else if (trk == QStringLiteral("zerocoin_pow")) ++zeroCount;
+    }
+
+    const ConsensusStatus cs = m_rpc->consensusStatus();
     int doubleMineTargets = 0;
+    int lockedWalletTargets = 0;
+    int ibdTargets = 0;
+    int nodeErrorTargets = 0;
+    QString chainName;
+    QString firstNodeErr;
     QSet<QString> seenTargetKeys;
 
     for (const WorkerProfile& p : profiles) {
@@ -1094,38 +1161,68 @@ void MainWindow::updateKpis()
         sumStale += rt.stale;
         sumRej += rt.rejected;
 
-        const PoolSeatInfo seat = m_rpc->seatInfoForAddress(p.coinbaseAddress);
-        if (seat.registered) ++regCount;
-        else if (active && (rt.warningDeferred || (seat.known && !seat.registered))) ++unregWasteCount;
-
         const QString tkey = p.targetKey();
+        const NodeMiningStatus ns = m_rpc->statusForTarget(tkey);
+        const QString pChain = !ns.chain.isEmpty() ? ns.chain : cs.chain;
+
+        const PoolSeatInfo seat = m_rpc->seatInfoForAddress(p.coinbaseAddress);
+        if (seat.registered) {
+            ++regCount;
+            if (seat.isExpiringSoon(pChain)) {
+                ++expiringSeats;
+            }
+        } else if (active && (rt.warningDeferred || (seat.known && !seat.registered))) {
+            ++unregWasteCount;
+        }
+
         if (!seenTargetKeys.contains(tkey)) {
             seenTargetKeys.insert(tkey);
-            const NodeMiningStatus ns = m_rpc->statusForTarget(tkey);
             if (ns.reachable) {
                 bestHeight = qMax(bestHeight, ns.blockHeight);
                 if (ns.internalGenerate) ++doubleMineTargets;
+                if (ns.walletLocked) ++lockedWalletTargets;
+                if (ns.initialBlockDownload) ++ibdTargets;
+                if (!ns.nodeErrors.isEmpty()) {
+                    ++nodeErrorTargets;
+                    if (firstNodeErr.isEmpty()) firstNodeErr = ns.nodeErrors;
+                }
+                if (chainName.isEmpty() && !ns.chain.isEmpty()) {
+                    chainName = ns.chain;
+                }
             }
         }
+    }
+    if (chainName.isEmpty()) {
+        chainName = cs.chain;
     }
 
     m_kpiValWorkers->setText(QStringLiteral("%1 / %2").arg(running).arg(total));
     m_kpiSubWorkers->setText(QStringLiteral("CPU: %1 • GPU: %2").arg(cpuCount).arg(gpuCount));
 
-    auto setKpiWarnState = [](QLabel* lbl, bool warn) {
-        const QString target = warn ? QStringLiteral("warn") : QString();
-        if (lbl->property("state").toString() != target) {
-            lbl->setProperty("state", target);
+    auto setKpiState = [](QLabel* lbl, const QString& state) {
+        if (lbl->property("state").toString() != state) {
+            lbl->setProperty("state", state);
             lbl->style()->unpolish(lbl);
             lbl->style()->polish(lbl);
         }
     };
 
+    const QString breakdownStr = (poolSize > 0)
+        ? KTr(QStringLiteral("kpi.pool_breakdown")).arg(poolSize).arg(mnCount).arg(clCount).arg(powCount).arg(zeroCount)
+        : QStringLiteral("Pool total: 0");
     m_kpiValPool->setText(QStringLiteral("%1 / %2").arg(regCount).arg(total));
-    m_kpiSubPool->setText(unregWasteCount > 0
-        ? QStringLiteral("⚠ %1 running unreg").arg(unregWasteCount)
-        : QStringLiteral("Pool total: %1").arg(poolSize));
-    setKpiWarnState(m_kpiSubPool, unregWasteCount > 0);
+    m_kpiValPool->setToolTip(breakdownStr);
+    m_kpiSubPool->setToolTip(breakdownStr);
+    if (unregWasteCount > 0) {
+        m_kpiSubPool->setText(QStringLiteral("⚠ %1 running unreg").arg(unregWasteCount));
+        setKpiState(m_kpiSubPool, QStringLiteral("warn"));
+    } else if (expiringSeats > 0) {
+        m_kpiSubPool->setText(KTr(QStringLiteral("kpi.pool_expiring")).arg(expiringSeats));
+        setKpiState(m_kpiSubPool, QStringLiteral("warn"));
+    } else {
+        m_kpiSubPool->setText(breakdownStr);
+        setKpiState(m_kpiSubPool, QString());
+    }
 
     m_kpiValHash->setText(formatHashrateKhs(sumKhs));
     m_kpiSubHash->setText(QStringLiteral("%1 active workers").arg(running));
@@ -1142,11 +1239,56 @@ void MainWindow::updateKpis()
         m_kpiSubGpu->setText(KTr(QStringLiteral("kpi.no_gpu")));
     }
 
-    m_kpiValNet->setText(bestHeight > 0 ? QStringLiteral("Block #%1").arg(bestHeight) : QStringLiteral("RPC Syncing..."));
-    m_kpiSubNet->setText(doubleMineTargets > 0
-        ? QStringLiteral("%1 (%2 nodes)").arg(KTr(QStringLiteral("kpi.double_mine_warn"))).arg(doubleMineTargets)
-        : KTr(QStringLiteral("kpi.double_mine_clean")));
-    setKpiWarnState(m_kpiSubNet, doubleMineTargets > 0);
+    if (bestHeight > 0) {
+        QString netPrefix = QStringLiteral("Block ");
+        if (chainName == QStringLiteral("test")) {
+            netPrefix = QStringLiteral("Testnet ");
+        } else if (chainName == QStringLiteral("regtest")) {
+            netPrefix = QStringLiteral("Regtest ");
+        }
+        QString netText = netPrefix + QStringLiteral("#%1").arg(bestHeight);
+        if (!cs.badgeLabel().isEmpty()) {
+            netText += QStringLiteral(" • %1").arg(cs.badgeLabel());
+        }
+        m_kpiValNet->setText(netText);
+    } else {
+        m_kpiValNet->setText(QStringLiteral("RPC Syncing..."));
+    }
+
+    if (lockedWalletTargets > 0) {
+        m_kpiSubNet->setText(KTr(QStringLiteral("kpi.wallet_locked_warn")).arg(lockedWalletTargets));
+        setKpiState(m_kpiSubNet, QStringLiteral("danger"));
+    } else if (ibdTargets > 0 || cs.initialBlockDownload) {
+        m_kpiSubNet->setText(KTr(QStringLiteral("kpi.node_ibd")));
+        setKpiState(m_kpiSubNet, QStringLiteral("warn"));
+    } else if (nodeErrorTargets > 0) {
+        m_kpiSubNet->setText(KTr(QStringLiteral("kpi.node_alert")).arg(nodeErrorTargets));
+        setKpiState(m_kpiSubNet, QStringLiteral("danger"));
+    } else if (doubleMineTargets > 0) {
+        m_kpiSubNet->setText(QStringLiteral("%1 (%2 nodes)").arg(KTr(QStringLiteral("kpi.double_mine_warn"))).arg(doubleMineTargets));
+        setKpiState(m_kpiSubNet, QStringLiteral("warn"));
+    } else {
+        m_kpiSubNet->setText(KTr(QStringLiteral("kpi.double_mine_clean")));
+        setKpiState(m_kpiSubNet, QString());
+    }
+
+    QStringList netTipLines;
+    if (!chainName.isEmpty()) {
+        netTipLines << QStringLiteral("Chain: %1").arg(chainName);
+    }
+    if (!cs.activeUpgrades.isEmpty()) {
+        netTipLines << QStringLiteral("Active upgrades: %1").arg(cs.activeUpgrades.join(QStringLiteral(", ")));
+    }
+    if (lockedWalletTargets > 0) {
+        netTipLines << KTr(QStringLiteral("kpi.wallet_locked_warn")).arg(lockedWalletTargets);
+    }
+    if (!firstNodeErr.isEmpty()) {
+        netTipLines << KTr(QStringLiteral("warn.node_errors_banner")).arg(firstNodeErr);
+    }
+    const QString netTip = netTipLines.join(QLatin1Char('\n'));
+    m_kpiValNet->setToolTip(netTip);
+    m_kpiSubNet->setToolTip(netTip);
+
     updateInternalGenButton();
 }
 
@@ -1208,21 +1350,53 @@ void MainWindow::updateInspector()
     }
     const WorkerRuntime rt = m_controller->runtimeById(p.id);
     const PoolSeatInfo seat = m_rpc->seatInfoForAddress(p.coinbaseAddress);
+    const NodeMiningStatus nodeSt = m_rpc->statusForTarget(p.targetKey());
+    const QString chain = !nodeSt.chain.isEmpty() ? nodeSt.chain : m_rpc->consensusStatus().chain;
 
     QString meta = QStringLiteral("%1  •  PID: %2").arg(p.name).arg(rt.pid > 0 ? QString::number(rt.pid) : QStringLiteral("—"));
     if (rt.adopted) meta += QStringLiteral(" (Adopted)");
     if (rt.lastBlock > 0) meta += QStringLiteral("  •  Block #%1").arg(rt.lastBlock);
+    if (seat.registered) meta += QStringLiteral("  •  %1").arg(formatSeatTrackBadge(seat));
     m_lblInspectorMeta->setText(meta);
 
+    const bool walletLockedWarn = (nodeSt.reachable && nodeSt.walletLocked) || rt.warningWalletLocked;
     const bool wasteWarn = rt.warningDeferred || (!p.coinbaseAddress.isEmpty() && seat.known && !seat.registered);
-    if (wasteWarn) {
+    const bool expiringWarn = seat.isExpiringSoon(chain);
+    const bool nodeAlertWarn = nodeSt.reachable && !nodeSt.nodeErrors.isEmpty();
+
+    if (walletLockedWarn) {
+        m_lblWarnBanner->setText(KTr(QStringLiteral("warn.wallet_locked_banner")));
+        m_btnFixDoubleMine->setVisible(false);
+        if (m_btnRenewSeat) m_btnRenewSeat->setVisible(false);
+        m_warnBanner->setVisible(true);
+    } else if (wasteWarn) {
         const QString msg = (rt.warningDeferred && !rt.warningDeferredMsg.isEmpty())
             ? (KTr(QStringLiteral("warn.waste_banner")) + QStringLiteral(" (") + rt.warningDeferredMsg + QLatin1Char(')'))
             : KTr(QStringLiteral("warn.waste_banner"));
         m_lblWarnBanner->setText(msg);
         m_btnFixDoubleMine->setVisible(false);
+        if (m_btnRenewSeat) m_btnRenewSeat->setVisible(false);
+        m_warnBanner->setVisible(true);
+    } else if (expiringWarn) {
+        const qint64 approxMin = qMax<qint64>(1, (seat.remainingBlocks * 30 + 30) / 60);
+        m_lblWarnBanner->setText(
+            KTr(QStringLiteral("warn.expiring_banner")).arg(seat.track).arg(seat.remainingBlocks).arg(approxMin));
+        m_btnFixDoubleMine->setVisible(false);
+        if (m_btnRenewSeat) {
+            const bool canRenew = seat.isRenewableTrack() && nodeSt.reachable;
+            const bool renewing = m_renewingWorkers.contains(p.id);
+            m_btnRenewSeat->setText(KTr(renewing ? QStringLiteral("btn.renewing_seat") : QStringLiteral("btn.renew_seat")));
+            m_btnRenewSeat->setEnabled(!renewing);
+            m_btnRenewSeat->setVisible(canRenew);
+        }
+        m_warnBanner->setVisible(true);
+    } else if (nodeAlertWarn) {
+        m_lblWarnBanner->setText(KTr(QStringLiteral("warn.node_errors_banner")).arg(nodeSt.nodeErrors));
+        m_btnFixDoubleMine->setVisible(false);
+        if (m_btnRenewSeat) m_btnRenewSeat->setVisible(false);
         m_warnBanner->setVisible(true);
     } else {
+        if (m_btnRenewSeat) m_btnRenewSeat->setVisible(false);
         m_warnBanner->setVisible(false);
     }
 
@@ -1302,6 +1476,55 @@ void MainWindow::onStopUnregistered()
         return;
     }
     m_controller->stopUnregisteredOrDeferred();
+}
+
+void MainWindow::onRenewSelectedSeat()
+{
+    const WorkerProfile p = m_controller->profileById(m_selectedWorkerId);
+    if (p.id.isEmpty() || p.coinbaseAddress.isEmpty()) {
+        return;
+    }
+    const PoolSeatInfo seat = m_rpc->seatInfoForAddress(p.coinbaseAddress);
+    const NodeMiningStatus nodeSt = m_rpc->statusForTarget(p.targetKey());
+    if (!seat.registered || !seat.isRenewableTrack() || !nodeSt.reachable || nodeSt.walletLocked) {
+        return;
+    }
+    if (m_renewingWorkers.contains(p.id)) {
+        return;
+    }
+
+    const QString confirmMsg = (seat.track == QStringLiteral("coin_lock"))
+        ? KTr(QStringLiteral("confirm.renew_msg_lock")).arg(p.coinbaseAddress, p.targetKey())
+        : KTr(QStringLiteral("confirm.renew_msg_pow")).arg(seat.track, p.coinbaseAddress, p.targetKey());
+
+    if (QMessageBox::question(this,
+                              KTr(QStringLiteral("confirm.renew_title")),
+                              confirmMsg) != QMessageBox::Yes) {
+        return;
+    }
+
+    m_renewingWorkers.insert(p.id);
+    updateInspector();
+
+    const qint64 tipH = qMax(nodeSt.blockHeight, seat.chainHeight);
+    const QString workerId = p.id;
+    QPointer<MainWindow> self(this);
+    m_rpc->renewMinerSeat(p, seat.track, p.coinbaseAddress, tipH,
+                          [self, workerId](bool ok, const QString& txidOrErr) {
+                              if (!self) return;
+                              self->m_renewingWorkers.remove(workerId);
+                              self->updateInspector();
+                              if (ok) {
+                                  self->m_rpc->refreshTargets(self->m_controller->profiles());
+                                  QMessageBox::information(self,
+                                                           KTr(QStringLiteral("confirm.renew_title")),
+                                                           KTr(QStringLiteral("msg.renew_ok")).arg(txidOrErr));
+                              } else {
+                                  QMessageBox::warning(self,
+                                                       KTr(QStringLiteral("confirm.renew_title")),
+                                                       KTr(QStringLiteral("msg.renew_fail")).arg(txidOrErr));
+                              }
+                          });
 }
 
 void MainWindow::onAutoStopDeferredToggled(bool enabled)

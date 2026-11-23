@@ -13,8 +13,10 @@
 #include <QFileDialog>
 #include <QFontMetrics>
 #include <QFormLayout>
+#include <QFrame>
 #include <QHeaderView>
 #include <QItemSelectionModel>
+#include <QLabel>
 #include <QLayout>
 #include <QLineEdit>
 #include <QListView>
@@ -128,6 +130,7 @@ private Q_SLOTS:
     void testActionButtonsNotClippedWithVerticalScrollbar();
     void testWorkerDialogCustomRpcAndRemoteSshVisibilityAndValidation();
     void testFileDialogAndItemViewsThemeContrast();
+    void testFairnessWalletLockAndSeatExpiryUi();
 
 private:
     QTemporaryDir m_settingsDir;
@@ -1061,6 +1064,151 @@ void TestUi::testFileDialogAndItemViewsThemeContrast()
     }
 
     Theme::applyTheme(qApp, false);
+}
+
+void TestUi::testFairnessWalletLockAndSeatExpiryUi()
+{
+    QTemporaryDir tmpDir;
+    QVERIFY(tmpDir.isValid());
+    ConfigStore store(tmpDir.path());
+    RpcClient rpc;
+    WorkerController controller(&store, &rpc);
+    controller.loadInitialState(/*autoDiscoverIfEmpty=*/false);
+
+    auto makeCustom = [&](const QString& id, const QString& name, const QString& url, const QString& addr) {
+        WorkerProfile p;
+        p.id = id;
+        p.name = name;
+        p.engine = MinerEngine::CpuMiner;
+        p.threads = 1;
+        p.targetType = TargetType::CustomRpc;
+        p.rpcUrl = url;
+        p.rpcUser = QStringLiteral("u");
+        p.rpcPassword = QStringLiteral("p");
+        p.coinbaseAddress = addr;
+        controller.addProfile(p);
+        return p;
+    };
+
+    const WorkerProfile pMn = makeCustom(
+        QStringLiteral("w_mn"), QStringLiteral("01_masternode"),
+        QStringLiteral("http://127.0.0.1:28001/"), QStringLiteral("KTMnAddr00000000000000000000000001"));
+    const WorkerProfile pPowExp = makeCustom(
+        QStringLiteral("w_pow_exp"), QStringLiteral("02_pow_expiring"),
+        QStringLiteral("http://127.0.0.1:28002/"), QStringLiteral("KTPowExp0000000000000000000000001"));
+    const WorkerProfile pZeroExp = makeCustom(
+        QStringLiteral("w_zero_exp"), QStringLiteral("03_zero_expiring"),
+        QStringLiteral("http://127.0.0.1:28002/"), QStringLiteral("KTZeroExp000000000000000000000001"));
+    const WorkerProfile pLocked = makeCustom(
+        QStringLiteral("w_locked"), QStringLiteral("04_wallet_locked"),
+        QStringLiteral("http://127.0.0.1:28003/"), QStringLiteral("KTLockCl0000000000000000000000001"));
+
+    I18n::instance().setLanguage(I18n::Language::EN);
+    MainWindow win(&store, &rpc, &controller, false);
+    win.show();
+    // Drain initial async refreshTargets() connection-refused probes from MainWindow ctor before injecting mock states
+    QTRY_VERIFY_WITH_TIMEOUT(
+        rpc.statusForTarget(pMn.targetKey()).checked
+        && rpc.statusForTarget(pPowExp.targetKey()).checked
+        && rpc.statusForTarget(pLocked.targetKey()).checked,
+        3000);
+
+    ConsensusStatus cs;
+    cs.known = true;
+    cs.chain = QStringLiteral("main");
+    cs.fairnessActive = true;
+    cs.modelDActive = true;
+    cs.activeUpgrades = {QStringLiteral("Fairness"), QStringLiteral("Model D")};
+    rpc.setConsensusStatus(cs);
+
+    NodeMiningStatus nsUnlocked;
+    nsUnlocked.checked = true;
+    nsUnlocked.reachable = true;
+    nsUnlocked.blockHeight = 9000;
+    nsUnlocked.chain = QStringLiteral("main");
+    nsUnlocked.walletChecked = true;
+    nsUnlocked.walletLocked = false;
+    rpc.setTargetStatus(pMn.targetKey(), nsUnlocked);
+    rpc.setTargetStatus(pPowExp.targetKey(), nsUnlocked);
+
+    NodeMiningStatus nsLocked = nsUnlocked;
+    nsLocked.walletEncrypted = true;
+    nsLocked.walletLocked = true;
+    rpc.setTargetStatus(pLocked.targetKey(), nsLocked);
+
+    QHash<QString, PoolSeatInfo> seats;
+    seats.insert(pMn.coinbaseAddress, PoolSeatInfo{true, true, QStringLiteral("masternode"), 0, 0, 9000});
+    seats.insert(pPowExp.coinbaseAddress, PoolSeatInfo{true, true, QStringLiteral("pow_lock"), 9120, 120, 9000});
+    seats.insert(pZeroExp.coinbaseAddress, PoolSeatInfo{true, true, QStringLiteral("zerocoin_pow"), 9018, 18, 9000});
+    seats.insert(pLocked.coinbaseAddress, PoolSeatInfo{true, true, QStringLiteral("coin_lock"), 11500, 2500, 9000});
+    rpc.setPoolSeatsForTest(seats, 9000);
+    QApplication::processEvents();
+
+    QTableWidget* table = win.findChild<QTableWidget*>();
+    QVERIFY(table != nullptr);
+    QCOMPARE(table->rowCount(), 4);
+
+    // Masternode has no bogus (0b), expiring tracks show warning badge, locked node shows Wallet Locked
+    QCOMPARE(table->item(0, 4)->text(), QStringLiteral("✓ masternode"));
+    QCOMPARE(table->item(1, 4)->text(), QStringLiteral("⚠ pow_lock (120b)"));
+    QCOMPARE(table->item(2, 4)->text(), QStringLiteral("⚠ zerocoin_pow (18b)"));
+    QVERIFY(table->item(3, 4)->text().contains(KTr(QStringLiteral("pool.wallet_locked"))));
+
+    // Warnings pill counts rows 1, 2, 3 (not healthy masternode row 0)
+    QPushButton* warnPill = nullptr;
+    int pillIdx = 0;
+    for (QPushButton* b : win.findChildren<QPushButton*>()) {
+        if (b->property("variant").toString() == QStringLiteral("pill")) {
+            if (pillIdx == 3) warnPill = b;
+            ++pillIdx;
+        }
+    }
+    QVERIFY(warnPill != nullptr);
+    QVERIFY(warnPill->text().contains(QStringLiteral("(3)")));
+
+    QFrame* warnBanner = win.findChild<QFrame*>(QStringLiteral("warningBanner"));
+    QPushButton* btnRenew = win.findChild<QPushButton*>(QStringLiteral("btnRenewSeat"));
+    QVERIFY(warnBanner != nullptr);
+    QVERIFY(btnRenew != nullptr);
+
+    // Selecting expiring pow_lock shows banner + Renew Seat button
+    table->selectRow(1);
+    QApplication::processEvents();
+    QVERIFY(warnBanner->isVisibleTo(&win));
+    QVERIFY(btnRenew->isVisibleTo(&win));
+
+    // Selecting locked-wallet worker shows locked warning and hides Renew Seat button
+    table->selectRow(3);
+    QApplication::processEvents();
+    QVERIFY(warnBanner->isVisibleTo(&win));
+    QVERIFY(!btnRenew->isVisibleTo(&win));
+
+    // Network KPI surfaces Fairness consensus badge + Locked Wallet alert in EN & TR
+    QList<QFrame*> kpiCards;
+    for (QFrame* f : win.findChildren<QFrame*>()) {
+        if (f->objectName() == QStringLiteral("kpiCard")) kpiCards.append(f);
+    }
+    QCOMPARE(kpiCards.size(), 6);
+    QLabel* netVal = kpiCards[5]->findChild<QLabel*>(QStringLiteral("kpiValue"));
+    QLabel* netSub = kpiCards[5]->findChild<QLabel*>(QStringLiteral("kpiSub"));
+    QVERIFY(netVal != nullptr);
+    QVERIFY(netSub != nullptr);
+    QCOMPARE(netVal->text(), QStringLiteral("Block #9000 • Fairness"));
+    QCOMPARE(netSub->text(), QStringLiteral("🔒 Wallet Locked (1 node(s))"));
+
+    I18n::instance().setLanguage(I18n::Language::TR);
+    QApplication::processEvents();
+    QCOMPARE(netSub->text(), QStringLiteral("🔒 Cüzdan Kilitli (1 düğüm)"));
+    QVERIFY(table->item(3, 4)->text().contains(QStringLiteral("Cüzdan Kilitli")));
+    I18n::instance().setLanguage(I18n::Language::EN);
+
+    // WorkerDialog expiring-seat warning visibility check
+    WorkerDialog dlg(&pPowExp, &rpc, {}, {});
+    dlg.show();
+    QApplication::processEvents();
+    QFrame* dlgWarn = dlg.findChild<QFrame*>(QStringLiteral("warningBanner"));
+    QVERIFY(dlgWarn != nullptr);
+    QVERIFY(dlgWarn->isVisibleTo(&dlg));
 }
 
 QTEST_MAIN(TestUi)

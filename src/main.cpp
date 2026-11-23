@@ -17,6 +17,7 @@ int main(int argc, char* argv[])
 {
     QApplication app(argc, argv);
     app.setApplicationName(QStringLiteral("KristaTechMinerManager"));
+    app.setApplicationVersion(QStringLiteral(KMM_APP_VERSION));
     app.setOrganizationName(QStringLiteral("KristaTech"));
     QGuiApplication::setDesktopFileName(QStringLiteral("kristatech-miner-manager"));
     app.setQuitOnLastWindowClosed(false);

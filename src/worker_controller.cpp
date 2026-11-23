@@ -1817,12 +1817,16 @@ void WorkerController::parseLogLine(const QString& sanitizedLine, WorkerRuntime&
         rt.lastBlock = m.captured(1).toLongLong();
         rt.warningRpcError = false;
         rt.warningRpcErrorMsg.clear();
+        rt.warningWalletLocked = false;
+        rt.warningWalletLockedMsg.clear();
         if (rt.status == WorkerStatus::Waiting || rt.status == WorkerStatus::Starting || rt.status == WorkerStatus::Adopted) {
             rt.status = WorkerStatus::Solving;
         }
     }
 
-    static const QRegularExpression reWaiting(QStringLiteral("Waiting for next block or election"));
+    static const QRegularExpression reWaiting(
+        QStringLiteral("Waiting for (?:next block or )?election"),
+        QRegularExpression::CaseInsensitiveOption);
     if (reWaiting.match(sanitizedLine).hasMatch()) {
         rt.status = WorkerStatus::Waiting;
         rt.hashrateKhs = 0.0;
@@ -1874,11 +1878,29 @@ void WorkerController::parseLogLine(const QString& sanitizedLine, WorkerRuntime&
         rt.warningDeferredMsg = m.captured(1).trimmed();
     }
     static const QRegularExpression reRegActive(
-        QStringLiteral("ADAM Auto-Register:.*(?:is active in ADAM pool|registered successfully)"),
+        QStringLiteral("ADAM Auto-Register:.*(?:is active in ADAM pool|registered successfully|successfully registered)"),
         QRegularExpression::CaseInsensitiveOption);
     if (reRegActive.match(sanitizedLine).hasMatch()) {
         rt.warningDeferred = false;
         rt.warningDeferredMsg.clear();
+        rt.warningWalletLocked = false;
+        rt.warningWalletLockedMsg.clear();
+    }
+    static const QRegularExpression reRegPending(
+        QStringLiteral("ADAM Auto-Register:.*waiting for block #\\d+"),
+        QRegularExpression::CaseInsensitiveOption);
+    if (reRegPending.match(sanitizedLine).hasMatch()) {
+        rt.warningDeferred = false;
+        rt.warningDeferredMsg.clear();
+    }
+
+    // Locked wallet errors in auto-register / mining logs
+    static const QRegularExpression reWalletLocked(
+        QStringLiteral("(?:walletpassphrase|wallet is locked|unlock the wallet)"),
+        QRegularExpression::CaseInsensitiveOption);
+    if (reWalletLocked.match(sanitizedLine).hasMatch()) {
+        rt.warningWalletLocked = true;
+        rt.warningWalletLockedMsg = sanitizedLine;
     }
 
     // CPU temp

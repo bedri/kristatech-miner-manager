@@ -139,6 +139,58 @@ QString sanitizeWorkerId(const QString& raw)
     return out;
 }
 
+bool PoolSeatInfo::hasExpiry() const
+{
+    return registered && unlockHeight > 0;
+}
+
+qint64 PoolSeatInfo::renewalThresholdBlocks(const QString& chain) const
+{
+    if (!hasExpiry()) {
+        return 0;
+    }
+    const QString c = chain.trimmed().toLower();
+    const bool isShortTest = (c == QStringLiteral("test") || c == QStringLiteral("regtest"));
+    if (track == QStringLiteral("zerocoin_pow")) {
+        return isShortTest ? 8 : 24;
+    }
+    return isShortTest ? 15 : 240;
+}
+
+bool PoolSeatInfo::isExpiringSoon(const QString& chain) const
+{
+    return hasExpiry() && remainingBlocks <= renewalThresholdBlocks(chain);
+}
+
+bool PoolSeatInfo::isRenewableTrack() const
+{
+    return track == QStringLiteral("coin_lock")
+        || track == QStringLiteral("pow_lock")
+        || track == QStringLiteral("zerocoin_pow");
+}
+
+QString formatSeatTrackBadge(const PoolSeatInfo& seat)
+{
+    if (!seat.registered) {
+        return {};
+    }
+    if (!seat.hasExpiry()) {
+        return seat.track;
+    }
+    return QStringLiteral("%1 (%2b)").arg(seat.track).arg(seat.remainingBlocks);
+}
+
+QString ConsensusStatus::badgeLabel() const
+{
+    if (fairnessActive) {
+        return QStringLiteral("Fairness");
+    }
+    if (modelDActive) {
+        return QStringLiteral("Model D");
+    }
+    return {};
+}
+
 QString formatHashrateKhs(double khs)
 {
     if (khs <= 0.0) {
@@ -286,6 +338,8 @@ void WorkerRuntime::resetRuntimeStats()
     hashrateDisplay.clear();
     warningDeferred = false;
     warningDeferredMsg.clear();
+    warningWalletLocked = false;
+    warningWalletLockedMsg.clear();
     warningRpcError = false;
     warningRpcErrorMsg.clear();
     lastError.clear();

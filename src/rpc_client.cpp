@@ -46,6 +46,13 @@ bool parseCliJsonOutput(const QByteArray& raw, QJsonValue& valOut)
     return true;
 }
 
+QString shellQuoteRpcArg(const QString& s)
+{
+    QString esc = s;
+    esc.replace(QLatin1Char('\''), QStringLiteral("'\\''"));
+    return QLatin1Char('\'') + esc + QLatin1Char('\'');
+}
+
 } // namespace
 
 RpcClient::RpcClient(QObject* parent)
@@ -73,6 +80,23 @@ void RpcClient::setTargetStatus(const QString& targetKey, const NodeMiningStatus
 {
     m_targetStatuses.insert(targetKey, status);
     Q_EMIT targetStatusUpdated(targetKey, status);
+}
+
+void RpcClient::setConsensusStatus(const ConsensusStatus& status)
+{
+    m_consensus = status;
+    Q_EMIT consensusStatusUpdated(m_consensus);
+}
+
+void RpcClient::setPoolSeatsForTest(const QHash<QString, PoolSeatInfo>& seats, qint64 chainHeight)
+{
+    m_poolSeats = seats;
+    m_lastPoolHeight = chainHeight;
+    m_lastPoolFetchMs = QDateTime::currentMSecsSinceEpoch();
+    for (auto it = m_targetStatuses.begin(); it != m_targetStatuses.end(); ++it) {
+        it->poolSize = m_poolSeats.size();
+    }
+    Q_EMIT poolSeatsUpdated();
 }
 
 PoolSeatInfo RpcClient::seatInfoForAddress(const QString& address) const
@@ -131,6 +155,9 @@ void RpcClient::refreshTargets(const QVector<WorkerProfile>& profiles)
                       st.error.clear();
                       st.blockHeight = static_cast<qint64>(obj.value(QStringLiteral("blocks")).toDouble(0));
                       st.networkHashPs = obj.value(QStringLiteral("networkhashps")).toDouble(0.0);
+                      st.difficulty = obj.value(QStringLiteral("difficulty")).toDouble(0.0);
+                      st.chain = obj.value(QStringLiteral("chain")).toString().trimmed().toLower();
+                      st.nodeErrors = obj.value(QStringLiteral("errors")).toString().trimmed();
                       st.internalGenerate = obj.value(QStringLiteral("generate")).toBool(false);
                       st.internalThreads = obj.value(QStringLiteral("genproclimit")).toInt(0);
                       st.poolSize = m_poolSeats.size();
@@ -138,6 +165,10 @@ void RpcClient::refreshTargets(const QVector<WorkerProfile>& profiles)
 
                       if (p.targetType != TargetType::RemoteSsh || m_poolSeats.isEmpty()) {
                           fetchPoolIfNeeded(p, creds, st.blockHeight);
+                      }
+                      fetchWalletStatusIfNeeded(p, creds, tkey);
+                      if (p.targetType != TargetType::RemoteSsh || !m_consensus.known) {
+                          fetchConsensusIfNeeded(p, creds, tkey, st.blockHeight);
                       }
                   });
     }
@@ -191,6 +222,107 @@ void RpcClient::fetchPoolIfNeeded(const WorkerProfile& profile, const RpcCredent
                   if (profile.targetType == TargetType::LocalWallet && creds.valid && !allAddrs.isEmpty()) {
                       probeLocalSeatOwnership(profile, creds, allAddrs);
                   }
+              });
+}
+
+void RpcClient::fetchWalletStatusIfNeeded(const WorkerProfile& profile,
+                                          const RpcCredentials& creds,
+                                          const QString& targetKey)
+{
+    if (m_inflightWalletTargets.contains(targetKey)) {
+        return;
+    }
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    qint64 throttleMs = 0;
+    if (profile.targetType == TargetType::PodmanContainer) {
+        throttleMs = 24000;
+    } else if (profile.targetType == TargetType::RemoteSsh) {
+        throttleMs = 60000;
+    }
+    const qint64 lastMs = m_lastWalletCheckMs.value(targetKey, 0);
+    if (lastMs > 0 && throttleMs > 0 && (now - lastMs) < throttleMs) {
+        return;
+    }
+
+    m_inflightWalletTargets.insert(targetKey);
+    invokeRpc(profile, creds, QStringLiteral("getwalletinfo"), QJsonArray{},
+              [this, targetKey](bool ok, const QJsonValue& res, const QString&) {
+                  m_inflightWalletTargets.remove(targetKey);
+                  m_lastWalletCheckMs.insert(targetKey, QDateTime::currentMSecsSinceEpoch());
+                  if (!ok || !res.isObject()) {
+                      // Non-fatal: pruned/walletless nodes or test mocks without getwalletinfo remain unlocked.
+                      return;
+                  }
+                  const QJsonObject wobj = res.toObject();
+                  NodeMiningStatus st = m_targetStatuses.value(targetKey);
+                  st.walletChecked = true;
+                  if (wobj.contains(QStringLiteral("unlocked_until"))) {
+                      st.walletEncrypted = true;
+                      st.walletUnlockedUntil = static_cast<qint64>(wobj.value(QStringLiteral("unlocked_until")).toDouble(0));
+                      st.walletLocked = (st.walletUnlockedUntil == 0);
+                  } else {
+                      st.walletEncrypted = false;
+                      st.walletUnlockedUntil = 0;
+                      st.walletLocked = false;
+                  }
+                  setTargetStatus(targetKey, st);
+              });
+}
+
+void RpcClient::fetchConsensusIfNeeded(const WorkerProfile& profile,
+                                       const RpcCredentials& creds,
+                                       const QString& targetKey,
+                                       qint64 height)
+{
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (m_consensusFetchInflight) {
+        return;
+    }
+    if (m_lastConsensusFetchMs > 0 && height == m_lastConsensusHeight && (now - m_lastConsensusFetchMs) < 30000) {
+        return;
+    }
+
+    m_consensusFetchInflight = true;
+    invokeRpc(profile, creds, QStringLiteral("getblockchaininfo"), QJsonArray{},
+              [this, targetKey, height](bool ok, const QJsonValue& res, const QString&) {
+                  m_consensusFetchInflight = false;
+                  const qint64 doneMs = QDateTime::currentMSecsSinceEpoch();
+                  m_lastConsensusHeight = height;
+                  m_lastConsensusFetchMs = doneMs;
+                  if (!ok || !res.isObject()) {
+                      return;
+                  }
+
+                  const QJsonObject obj = res.toObject();
+                  ConsensusStatus next;
+                  next.known = true;
+                  next.chain = obj.value(QStringLiteral("chain")).toString().trimmed().toLower();
+                  next.initialBlockDownload = obj.value(QStringLiteral("initialblockdownload")).toBool(false);
+
+                  const QJsonObject upgrades = obj.value(QStringLiteral("upgrades")).toObject();
+                  for (auto it = upgrades.constBegin(); it != upgrades.constEnd(); ++it) {
+                      const QString name = it.key().trimmed();
+                      if (!it.value().isObject()) continue;
+                      const QJsonObject uo = it.value().toObject();
+                      if (uo.value(QStringLiteral("status")).toString().compare(QStringLiteral("active"), Qt::CaseInsensitive) == 0) {
+                          next.activeUpgrades.append(name);
+                          const QString low = name.toLower();
+                          if (low == QStringLiteral("fairness")) next.fairnessActive = true;
+                          else if (low == QStringLiteral("model d")) next.modelDActive = true;
+                          else if (low == QStringLiteral("adam open entry")) next.openEntryActive = true;
+                          else if (low == QStringLiteral("pombl")) next.pomblActive = true;
+                      }
+                  }
+
+                  if (m_targetStatuses.contains(targetKey)) {
+                      NodeMiningStatus st = m_targetStatuses.value(targetKey);
+                      if (st.initialBlockDownload != next.initialBlockDownload) {
+                          st.initialBlockDownload = next.initialBlockDownload;
+                          setTargetStatus(targetKey, st);
+                      }
+                  }
+
+                  setConsensusStatus(next);
               });
 }
 
@@ -257,6 +389,64 @@ void RpcClient::setInternalGenerate(const WorkerProfile& profile,
               });
 }
 
+void RpcClient::renewMinerSeat(const WorkerProfile& profile,
+                               const QString& track,
+                               const QString& address,
+                               qint64 tipHeight,
+                               std::function<void(bool ok, const QString& txidOrErr)> cb)
+{
+    const QString addr = address.trimmed();
+    const QString trk = track.trimmed();
+    if (addr.isEmpty()) {
+        if (cb) cb(false, QStringLiteral("Coinbase address is empty"));
+        return;
+    }
+    if (trk != QStringLiteral("coin_lock")
+        && trk != QStringLiteral("pow_lock")
+        && trk != QStringLiteral("zerocoin_pow")) {
+        if (cb) cb(false, QStringLiteral("Seat track '%1' is not renewable via registerminer").arg(trk));
+        return;
+    }
+
+    const RpcCredentials creds = (profile.targetType == TargetType::LocalWallet || profile.targetType == TargetType::CustomRpc)
+        ? ConfigStore::resolveCredentials(profile)
+        : RpcCredentials{};
+
+    if ((profile.targetType == TargetType::LocalWallet || profile.targetType == TargetType::CustomRpc) && !creds.valid) {
+        if (cb) cb(false, creds.error);
+        return;
+    }
+
+    QJsonArray params;
+    if (trk == QStringLiteral("coin_lock")) {
+        if (tipHeight <= 0) {
+            if (cb) cb(false, QStringLiteral("Chain tip height unavailable; wait for RPC sync"));
+            return;
+        }
+        params.append(QStringLiteral("lock"));
+        params.append(static_cast<double>(tipHeight + 2900));
+        params.append(addr);
+    } else {
+        params.append(QStringLiteral("pow"));
+        params.append(QStringLiteral(""));
+        params.append(addr);
+    }
+
+    invokeRpc(profile, creds, QStringLiteral("registerminer"), params,
+              [this, cb](bool ok, const QJsonValue& res, const QString& err) {
+                  if (ok) {
+                      m_lastPoolFetchMs = 0;
+                  }
+                  if (cb) {
+                      const QString detail = ok
+                          ? (res.isString() ? res.toString().trimmed() : res.toVariant().toString().trimmed())
+                          : err;
+                      cb(ok, detail);
+                  }
+              },
+              120000);
+}
+
 void RpcClient::discoverLocalRegisteredSeats(const QString& confPath, std::function<void(QVector<QString> addresses)> cb)
 {
     WorkerProfile p;
@@ -305,7 +495,8 @@ void RpcClient::invokeRpc(const WorkerProfile& profile,
                           const RpcCredentials& creds,
                           const QString& method,
                           const QJsonArray& params,
-                          RpcCallback cb)
+                          RpcCallback cb,
+                          int timeoutMs)
 {
     if (profile.targetType == TargetType::PodmanContainer) {
         QStringList args{
@@ -330,11 +521,11 @@ void RpcClient::invokeRpc(const WorkerProfile& profile,
             if (cb) cb(false, QJsonValue(), QStringLiteral("Invalid SSH target"));
             return;
         }
-        QStringList remoteCmd{QStringLiteral("kristatech-cli"), method};
+        QStringList remoteCmd{QStringLiteral("kristatech-cli"), shellQuoteRpcArg(method)};
         for (const QJsonValue& pv : params) {
             if (pv.isBool()) remoteCmd.append(pv.toBool() ? QStringLiteral("true") : QStringLiteral("false"));
             else if (pv.isDouble()) remoteCmd.append(QString::number(static_cast<qint64>(pv.toDouble())));
-            else remoteCmd.append(pv.toString());
+            else remoteCmd.append(shellQuoteRpcArg(pv.toString()));
         }
         QStringList args{
             QStringLiteral("-o"), QStringLiteral("BatchMode=yes"),
@@ -348,13 +539,14 @@ void RpcClient::invokeRpc(const WorkerProfile& profile,
         return;
     }
 
-    invokeHttpJsonRpc(creds, method, params, cb);
+    invokeHttpJsonRpc(creds, method, params, cb, timeoutMs);
 }
 
 void RpcClient::invokeHttpJsonRpc(const RpcCredentials& creds,
                                   const QString& method,
                                   const QJsonArray& params,
-                                  RpcCallback cb)
+                                  RpcCallback cb,
+                                  int timeoutMs)
 {
     if (!creds.valid) {
         if (cb) cb(false, QJsonValue(), creds.error);
@@ -364,7 +556,7 @@ void RpcClient::invokeHttpJsonRpc(const RpcCredentials& creds,
     QUrl url(creds.url);
     QNetworkRequest req(url);
     req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
-    req.setTransferTimeout(5000);
+    req.setTransferTimeout(timeoutMs > 0 ? timeoutMs : 5000);
     const QByteArray auth = (creds.user + QLatin1Char(':') + creds.password).toUtf8().toBase64();
     req.setRawHeader("Authorization", "Basic " + auth);
 

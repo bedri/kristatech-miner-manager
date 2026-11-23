@@ -297,9 +297,8 @@ void WorkerDialog::populateAddresses()
     if (!m_rpc) return;
     const auto localSeats = m_rpc->localOwnedSeats();
     for (const auto& pair : localSeats) {
-        const QString label = QStringLiteral("%1  [Wallet: %2, %3b left]")
-            .arg(pair.first, pair.second.track)
-            .arg(pair.second.remainingBlocks);
+        const QString badge = formatSeatTrackBadge(pair.second);
+        const QString label = QStringLiteral("%1  [Wallet: %2]").arg(pair.first, badge);
         m_comboAddress->addItem(label, pair.first);
     }
     const auto allSeats = m_rpc->allKnownSeats();
@@ -373,7 +372,17 @@ void WorkerDialog::validateAddressWarning()
         return;
     }
     const PoolSeatInfo seat = m_rpc->seatInfoForAddress(addr);
-    m_warnFrame->setVisible(seat.known && !seat.registered);
+    if (seat.known && !seat.registered) {
+        m_warnLabel->setText(KTr(QStringLiteral("dlg.unreg_warn")));
+        m_warnFrame->setVisible(true);
+    } else if (seat.isExpiringSoon(m_rpc->consensusStatus().chain)) {
+        m_warnLabel->setText(KTr(QStringLiteral("dlg.expiring_warn"))
+                                 .arg(seat.track)
+                                 .arg(seat.remainingBlocks));
+        m_warnFrame->setVisible(true);
+    } else {
+        m_warnFrame->setVisible(false);
+    }
 }
 
 void WorkerDialog::updateVisibilityForEngineAndTarget()

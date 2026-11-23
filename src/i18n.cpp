@@ -77,6 +77,12 @@ void I18n::initTable()
     add("kpi.no_gpu", "No NVIDIA GPU / nvidia-smi", "NVIDIA GPU yok / nvidia-smi bulunamadı");
     add("kpi.double_mine_warn", "Internal CPU Gen ON", "Dahili CPU Kazımı AÇIK");
     add("kpi.double_mine_clean", "Internal CPU Gen OFF", "Dahili CPU Kazımı KAPALI");
+    add("kpi.wallet_locked_warn", "🔒 Wallet Locked (%1 node(s))", "🔒 Cüzdan Kilitli (%1 düğüm)");
+    add("kpi.node_ibd", "Syncing Blockchain (IBD)", "Blokzincir Senkronize Ediliyor (IBD)");
+    add("kpi.node_alert", "⚠ Node Alert (%1)", "⚠ Düğüm Uyarısı (%1)");
+    add("kpi.pool_breakdown", "Pool: %1 (MN:%2 CL:%3 PoW:%4 0-PoW:%5)",
+        "Havuz: %1 (MN:%2 CL:%3 PoW:%4 0-PoW:%5)");
+    add("kpi.pool_expiring", "⚠ %1 seat(s) expiring soon", "⚠ %1 koltuk yakında doluyor");
 
     // Filters
     add("filter.all", "All", "Tümü");
@@ -116,14 +122,35 @@ void I18n::initTable()
     add("pool.deferred", "Auto-Register Deferred", "Otomatik Kayıt Ertelendi");
     add("pool.checking", "Checking RPC...", "RPC Kontrol Ediliyor...");
     add("pool.rpc_offline", "RPC Unreachable", "RPC Erişilemiyor");
+    add("pool.wallet_locked", "Wallet Locked", "Cüzdan Kilitli");
+    add("pool.expiring_tip",
+        "%1 seat expires in %2 block(s) (~%3 min). Early renewal window is open (<= %4 blocks).",
+        "%1 koltuğunun süresi %2 blok (~%3 dk) içinde doluyor. Erken yenileme penceresi açık (<= %4 blok).");
+    add("pool.permanent_tip",
+        "%1 seat active in ADAM pool (no lease expiration).",
+        "%1 koltuğu ADAM havuzunda aktif (süre sonu yok).");
+    add("pool.active_tip",
+        "%1 seat active (%2 blocks / ~%3 min remaining; early renewal opens at <= %4 blocks).",
+        "%1 koltuğu aktif (%2 blok / ~%3 dk kaldı; erken yenileme <= %4 blokta açılır).");
     add("pool.double_mining", "Double Mining Active", "Çift Madencilik Aktif");
     add("warn.waste_banner",
         "Warning: Selected worker address is NOT registered or Auto-Register is deferred. It cannot earn extra ADAM seats.",
         "Uyarı: Seçili işçi adresi havuza kayıtlı değil veya otomatik kayıt ertelendi. Ek ADAM koltuğu kazanamaz.");
+    add("warn.wallet_locked_banner",
+        "Warning: Target node wallet is LOCKED. Unlock it in KristaTech Core to sign ADAM puzzles and renew/register seats.",
+        "Uyarı: Hedef düğüm cüzdanı KİLİTLİ. ADAM bulmacalarının imzalanması ve koltuk yenileme/kayıt için KristaTech Core'da cüzdan kilidini açın.");
+    add("warn.expiring_banner",
+        "Notice: %1 seat expires in %2 block(s) (~%3 min) — early renewal window is open.",
+        "Bilgi: %1 koltuğunun süresi %2 blok (~%3 dk) içinde doluyor — erken yenileme penceresi açık.");
+    add("warn.node_errors_banner",
+        "Node alert on target: %1",
+        "Hedef düğüm uyarısı: %1");
     add("warn.double_banner",
         "Notice: Target node also has internal CPU mining (generate=true) enabled alongside this external worker.",
         "Bilgi: Hedef düğümde harici işçi yanında dahili CPU madenciliği (generate=true) de açık.");
     add("btn.fix_disable_gen", "Disable Internal Gen on Target", "Hedefte Dahili Kazımı Kapat");
+    add("btn.renew_seat", "Renew Seat", "Koltuğu Yenile");
+    add("btn.renewing_seat", "Renewing...", "Yenileniyor...");
 
     // Row actions & Inspector
     add("act.start", "Start", "Başlat");
@@ -177,6 +204,9 @@ void I18n::initTable()
     add("dlg.unreg_warn",
         "Note: This address is not currently in the active ADAM pool. You can still save and run it, or pick a registered seat.",
         "Not: Bu adres şu anda aktif ADAM havuzunda değil. Yine de kaydedip çalıştırabilir veya kayıtlı bir koltuk seçebilirsiniz.");
+    add("dlg.expiring_warn",
+        "Note: This %1 seat expires in %2 block(s) — early renewal window is open.",
+        "Not: Bu %1 koltuğunun süresi %2 blok içinde doluyor — erken yenileme penceresi açık.");
 
     // Tray & Close dialogs
     add("tray.show", "Show Miner Manager", "Yöneticiyi Göster");
@@ -208,4 +238,13 @@ void I18n::initTable()
         "%1 üzerinde dahili CPU madenciliği kapatıldı (setgenerate false).");
     add("msg.gen_enabled", "Enabled internal CPU mining (setgenerate true) on %1.",
         "%1 üzerinde dahili CPU madenciliği açıldı (setgenerate true).");
+    add("confirm.renew_title", "Renew ADAM Validator Seat", "ADAM Doğrulayıcı Koltuğunu Yenile");
+    add("confirm.renew_msg_lock",
+        "Renew 250-KRISTA Coin-Lock seat for %1 on %2?\n\nThis runs registerminer lock on the target node (250 KRISTA CLTV lock for ~2,880 blocks / ~24h).",
+        "%2 üzerinde %1 için 250 KRISTA Coin-Lock koltuğu yenilensin mi?\n\nBu işlem hedef düğümde registerminer lock çalıştırır (~2.880 blok / ~24 saat için 250 KRISTA CLTV kilidi).");
+    add("confirm.renew_msg_pow",
+        "Renew %1 seat for %2 on %3?\n\nThis runs registerminer pow on the target node (10 KRISTA PoW-Lock for ~2,880 blocks if >= 10.01 mature KRISTA is available, or 0 KRISTA Open-Entry PoW for 240 blocks).",
+        "%3 üzerinde %2 için %1 koltuğu yenilensin mi?\n\nBu işlem hedef düğümde registerminer pow çalıştırır (>= 10,01 olgun KRISTA varsa ~2.880 blokluk 10 KRISTA PoW-Lock, yoksa 240 blokluk 0 KRISTA Açık Giriş PoW).");
+    add("msg.renew_ok", "Seat renewal submitted!\nTxID: %1", "Koltuk yenileme gönderildi!\nTxID: %1");
+    add("msg.renew_fail", "Seat renewal failed: %1", "Koltuk yenileme başarısız: %1");
 }
