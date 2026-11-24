@@ -82,6 +82,8 @@ void I18n::initTable()
     add("kpi.node_alert", "⚠ Node Alert (%1)", "⚠ Düğüm Uyarısı (%1)");
     add("kpi.pool_breakdown", "Pool: %1 (MN:%2 CL:%3 PoW:%4 0-PoW:%5)",
         "Havuz: %1 (MN:%2 CL:%3 PoW:%4 0-PoW:%5)");
+    add("kpi.pool_breakdown_bs", "Pool: %1 (MN:%2 CL:%3 PoW:%4 0-PoW:%5 BS:%6)",
+        "Havuz: %1 (MN:%2 CL:%3 PoW:%4 0-PoW:%5 BS:%6)");
     add("kpi.pool_expiring", "⚠ %1 seat(s) expiring soon", "⚠ %1 koltuk yakında doluyor");
 
     // Filters
@@ -246,6 +248,9 @@ void I18n::initTable()
         "Boşa CPU/GPU harcamasını durdurmak için %1 kayıtsız/ertelenmiş işçi durdurulsun mu?");
     add("msg.discover_done", "Fleet discovery complete: %1 new worker(s) added, %2 running process(es) adopted.",
         "Filo keşfi tamamlandı: %1 yeni işçi eklendi, %2 çalışan süreç sahiplenildi.");
+    add("msg.discover_done_refreshed",
+        "Fleet discovery complete: %1 new worker(s) added, %2 running process(es) adopted, %3 stale Podman address(es) refreshed.",
+        "Filo keşfi tamamlandı: %1 yeni işçi eklendi, %2 çalışan süreç sahiplenildi, %3 eski Podman adresi yenilendi.");
     add("msg.export_ok", "Profiles exported cleanly to %1 (local/Podman passwords omitted).",
         "Profiller %1 dosyasına aktarıldı (yerel/Podman parolaları hariç tutuldu).");
     add("msg.import_ok", "Imported %1 worker profile(s) from %2.",

@@ -1210,6 +1210,34 @@ void TestUi::testFairnessWalletLockAndSeatExpiryUi()
     QFrame* dlgWarn = dlg.findChild<QFrame*>(QStringLiteral("warningBanner"));
     QVERIFY(dlgWarn != nullptr);
     QVERIFY(dlgWarn->isVisibleTo(&dlg));
+
+    // Pool KPI breakdown hides BS: when bootstrap == 0 and displays BS:<n> when bootstrap seats exist
+    QLabel* poolSub = kpiCards[1]->findChild<QLabel*>(QStringLiteral("kpiSub"));
+    QVERIFY(poolSub != nullptr);
+
+    QHash<QString, PoolSeatInfo> noBsSeats;
+    noBsSeats.insert(pMn.coinbaseAddress, PoolSeatInfo{true, true, QStringLiteral("masternode"), 0, 0, 9000});
+    noBsSeats.insert(pPowExp.coinbaseAddress, PoolSeatInfo{true, true, QStringLiteral("pow_lock"), 11880, 2880, 9000});
+    noBsSeats.insert(pZeroExp.coinbaseAddress, PoolSeatInfo{true, true, QStringLiteral("zerocoin_pow"), 9240, 240, 9000});
+    noBsSeats.insert(pLocked.coinbaseAddress, PoolSeatInfo{true, true, QStringLiteral("coin_lock"), 11880, 2880, 9000});
+    rpc.setPoolSeatsForTest(noBsSeats, 9000);
+    QApplication::processEvents();
+    QCOMPARE(poolSub->text(), QStringLiteral("Pool: 4 (MN:1 CL:1 PoW:1 0-PoW:1)"));
+
+    QHash<QString, PoolSeatInfo> bsSeats;
+    bsSeats.insert(QStringLiteral("KTZeroOnly00000000000000000000001"), PoolSeatInfo{true, true, QStringLiteral("zerocoin_pow"), 9240, 240, 9000});
+    for (int i = 0; i < 13; ++i) {
+        bsSeats.insert(QStringLiteral("KTBoot%1").arg(i, 2, 10, QLatin1Char('0')),
+                       PoolSeatInfo{true, true, QStringLiteral("bootstrap"), 0, 0, 9000});
+    }
+    rpc.setPoolSeatsForTest(bsSeats, 9000);
+    QApplication::processEvents();
+    QCOMPARE(poolSub->text(), QStringLiteral("Pool: 14 (MN:0 CL:0 PoW:0 0-PoW:1 BS:13)"));
+
+    I18n::instance().setLanguage(I18n::Language::TR);
+    QApplication::processEvents();
+    QCOMPARE(poolSub->text(), QStringLiteral("Havuz: 14 (MN:0 CL:0 PoW:0 0-PoW:1 BS:13)"));
+    I18n::instance().setLanguage(I18n::Language::EN);
 }
 
 void TestUi::testSecurityWarningsAndImportGuard()

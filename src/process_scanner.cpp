@@ -444,7 +444,7 @@ QVector<PodmanContainerInfo> ProcessScanner::discoverPodmanContainers()
 
     // Load previously assigned pod addresses if present
     QHash<QString, QString> savedPodAddrs;
-    const QString podAddrPath = QDir::homePath() + QStringLiteral("/.kristatech/cpuminer_pod_addresses.txt");
+    const QString podAddrPath = ConfigStore::defaultPodAddressesFilePath();
     QFile af(podAddrPath);
     if (af.open(QIODevice::ReadOnly)) {
         const QStringList lines = QString::fromUtf8(af.readAll()).split(QLatin1Char('\n'));

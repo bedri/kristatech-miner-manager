@@ -1130,12 +1130,14 @@ void MainWindow::updateKpis()
     int clCount = 0;
     int powCount = 0;
     int zeroCount = 0;
+    int bsCount = 0;
     for (auto it = knownSeats.constBegin(); it != knownSeats.constEnd(); ++it) {
         const QString& trk = it.value().track;
         if (trk == QStringLiteral("masternode")) ++mnCount;
         else if (trk == QStringLiteral("coin_lock")) ++clCount;
         else if (trk == QStringLiteral("pow_lock")) ++powCount;
         else if (trk == QStringLiteral("zerocoin_pow")) ++zeroCount;
+        else if (trk == QStringLiteral("bootstrap")) ++bsCount;
     }
 
     const ConsensusStatus cs = m_rpc->consensusStatus();
@@ -1207,9 +1209,12 @@ void MainWindow::updateKpis()
         }
     };
 
-    const QString breakdownStr = (poolSize > 0)
-        ? KTr(QStringLiteral("kpi.pool_breakdown")).arg(poolSize).arg(mnCount).arg(clCount).arg(powCount).arg(zeroCount)
-        : QStringLiteral("Pool total: 0");
+    QString breakdownStr = QStringLiteral("Pool total: 0");
+    if (poolSize > 0) {
+        breakdownStr = (bsCount > 0)
+            ? KTr(QStringLiteral("kpi.pool_breakdown_bs")).arg(poolSize).arg(mnCount).arg(clCount).arg(powCount).arg(zeroCount).arg(bsCount)
+            : KTr(QStringLiteral("kpi.pool_breakdown")).arg(poolSize).arg(mnCount).arg(clCount).arg(powCount).arg(zeroCount);
+    }
     m_kpiValPool->setText(QStringLiteral("%1 / %2").arg(regCount).arg(total));
     m_kpiValPool->setToolTip(breakdownStr);
     m_kpiSubPool->setToolTip(breakdownStr);
@@ -1460,9 +1465,11 @@ void MainWindow::onDiscoverFleet()
 {
     m_controller->autoDiscoverFleet([this](int added, int adopted) {
         m_rpc->refreshTargets(m_controller->profiles());
-        QMessageBox::information(this,
-                                 KTr(QStringLiteral("btn.discover")),
-                                 KTr(QStringLiteral("msg.discover_done")).arg(added).arg(adopted));
+        const int refreshed = m_controller->lastDiscoveryRefreshedCount();
+        const QString msg = (refreshed > 0)
+            ? KTr(QStringLiteral("msg.discover_done_refreshed")).arg(added).arg(adopted).arg(refreshed)
+            : KTr(QStringLiteral("msg.discover_done")).arg(added).arg(adopted);
+        QMessageBox::information(this, KTr(QStringLiteral("btn.discover")), msg);
     });
 }
 

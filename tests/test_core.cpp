@@ -40,6 +40,7 @@ private Q_SLOTS:
     void testRemoteSshLifecycleAndHealthCheck();
     void testKristaFairnessRpcAndSeatExpiry();
     void testSecurityHardening();
+    void testPodmanAddressRefreshAndSelection();
 };
 
 void TestCore::testParseKristaTechConf()
@@ -1745,6 +1746,159 @@ void TestCore::testSecurityHardening()
     ctrl.stopWorker(sshP.id);
     QTest::qWait(100);
 #endif
+}
+
+void TestCore::testPodmanAddressRefreshAndSelection()
+{
+    // 1. pickBestPodmanAddress priority: coin_lock > pow_lock > bootstrap > zerocoin_pow; skip masternode; fallback first
+    const QJsonArray groupings{
+        QJsonArray{
+            QJsonArray{QStringLiteral("KTMn1"), 0.0},
+            QJsonArray{QStringLiteral("KTZero1"), 0.0}
+        },
+        QJsonArray{
+            QJsonArray{QStringLiteral("KTBoot1"), 0.0},
+            QJsonArray{QStringLiteral("KTUnreg1"), 0.0}
+        },
+        QJsonArray{
+            QJsonArray{QStringLiteral("KTPow1"), 0.0},
+            QJsonArray{QStringLiteral("KTCl1"), 0.0}
+        }
+    };
+
+    QHash<QString, PoolSeatInfo> seats;
+    seats.insert(QStringLiteral("KTMn1"), PoolSeatInfo{true, true, QStringLiteral("masternode"), 0, 0, 100});
+    seats.insert(QStringLiteral("KTZero1"), PoolSeatInfo{true, true, QStringLiteral("zerocoin_pow"), 340, 240, 100});
+    seats.insert(QStringLiteral("KTBoot1"), PoolSeatInfo{true, true, QStringLiteral("bootstrap"), 0, 0, 100});
+    seats.insert(QStringLiteral("KTPow1"), PoolSeatInfo{true, true, QStringLiteral("pow_lock"), 2980, 2880, 100});
+    seats.insert(QStringLiteral("KTCl1"), PoolSeatInfo{true, true, QStringLiteral("coin_lock"), 2980, 2880, 100});
+
+    QCOMPARE(RpcClient::pickBestPodmanAddress(groupings, seats), QStringLiteral("KTCl1"));
+    seats.remove(QStringLiteral("KTCl1"));
+    QCOMPARE(RpcClient::pickBestPodmanAddress(groupings, seats), QStringLiteral("KTPow1"));
+    seats.remove(QStringLiteral("KTPow1"));
+    QCOMPARE(RpcClient::pickBestPodmanAddress(groupings, seats), QStringLiteral("KTBoot1"));
+    seats.remove(QStringLiteral("KTBoot1"));
+    QCOMPARE(RpcClient::pickBestPodmanAddress(groupings, seats), QStringLiteral("KTZero1"));
+
+    // Skip masternode-only seat and fall back to first wallet address
+    seats.remove(QStringLiteral("KTZero1"));
+    const QJsonArray fallbackGroupings{
+        QJsonArray{QJsonArray{QStringLiteral("KTFirstFallback"), 0.0}},
+        QJsonArray{QJsonArray{QStringLiteral("KTMn1"), 0.0}}
+    };
+    QCOMPARE(RpcClient::pickBestPodmanAddress(fallbackGroupings, seats), QStringLiteral("KTFirstFallback"));
+    QCOMPARE(RpcClient::pickBestPodmanAddress(QJsonArray{}, seats), QString());
+
+    // 2. ConfigStore::updatePodAddressesFile merges valid entries atomically with 0600 permissions
+    QTemporaryDir tmpDir;
+    QVERIFY(tmpDir.isValid());
+    const QString podAddrFile = tmpDir.filePath(QStringLiteral("cpuminer_pod_addresses.txt"));
+    QVERIFY(ConfigStore::writeFile0600(
+        podAddrFile, QByteArray("krista-cold-01 OLD_1\nkrista-cold-02 KEEP_2\n")));
+
+    QHash<QString, QString> updates;
+    updates.insert(QStringLiteral("krista-cold-01"), QStringLiteral("NEW_1"));
+    updates.insert(QStringLiteral("krista-cold-03"), QStringLiteral("NEW_3"));
+    updates.insert(QStringLiteral("--evil"), QStringLiteral("BAD"));
+    updates.insert(QStringLiteral("krista-cold-04"), QStringLiteral("BAD ADDR WITH SPACE"));
+    QVERIFY(ConfigStore::updatePodAddressesFile(updates, podAddrFile));
+
+    QFile rf(podAddrFile);
+    QVERIFY(rf.open(QIODevice::ReadOnly));
+    const QString mergedText = QString::fromUtf8(rf.readAll());
+    rf.close();
+    QCOMPARE(mergedText, QStringLiteral("krista-cold-01 NEW_1\nkrista-cold-02 KEEP_2\nkrista-cold-03 NEW_3\n"));
+#ifndef Q_OS_WIN
+    const QFileDevice::Permissions fPerms = QFileInfo(podAddrFile).permissions();
+    QVERIFY(!(fPerms & (QFileDevice::ReadGroup | QFileDevice::WriteGroup | QFileDevice::ReadOther | QFileDevice::WriteOther)));
+#endif
+
+    // 3. WorkerController::autoDiscoverFleet refreshes stale running Podman addresses cleanly
+    ConfigStore store(tmpDir.filePath(QStringLiteral("cfg")));
+    WorkerController ctrl(&store, nullptr);
+    ctrl.loadInitialState(/*autoDiscoverIfEmpty=*/false);
+
+    WorkerProfile cold1;
+    cold1.id = QStringLiteral("krista-cold-01");
+    cold1.name = QStringLiteral("krista-cold-01");
+    cold1.engine = MinerEngine::CpuMiner;
+    cold1.targetType = TargetType::PodmanContainer;
+    cold1.podmanName = QStringLiteral("krista-cold-01");
+    cold1.coinbaseAddress = QStringLiteral("OLD_1");
+    ctrl.addProfile(cold1);
+
+    WorkerProfile cold2;
+    cold2.id = QStringLiteral("krista-cold-02");
+    cold2.name = QStringLiteral("krista-cold-02");
+    cold2.engine = MinerEngine::CpuMiner;
+    cold2.targetType = TargetType::PodmanContainer;
+    cold2.podmanName = QStringLiteral("krista-cold-02");
+    cold2.coinbaseAddress = QStringLiteral("KEEP_2");
+    ctrl.addProfile(cold2);
+
+    ctrl.setPodAddressesFilePathForTest(podAddrFile);
+    ctrl.setPodmanDiscovererForTest([]() {
+        auto makePod = [](const QString& name, bool running, qint64 pid, const QString& addr) {
+            PodmanContainerInfo info;
+            info.name = name;
+            info.running = running;
+            info.pid = pid;
+            info.assignedAddress = addr;
+            return info;
+        };
+        QVector<PodmanContainerInfo> pods;
+        pods.append(makePod(QStringLiteral("krista-cold-01"), true, 1001, QStringLiteral("OLD_1")));
+        pods.append(makePod(QStringLiteral("krista-cold-02"), true, 1002, QStringLiteral("KEEP_2")));
+        pods.append(makePod(QStringLiteral("krista-cold-09"), false, 0, QStringLiteral("STOPPED_9")));
+        return pods;
+    });
+
+    QStringList resolvedPods;
+    ctrl.setPodmanAddressResolverForTest(
+        [&resolvedPods](const QString& podName,
+                        const QString& curAddr,
+                        std::function<void(bool, const QString&, bool)> done) {
+            resolvedPods.append(podName);
+            if (podName == QStringLiteral("krista-cold-01")) {
+                done(true, QStringLiteral("FRESH_1"), curAddr != QStringLiteral("FRESH_1"));
+            } else {
+                done(true, curAddr, false);
+            }
+        });
+
+    bool discDone = false;
+    ctrl.autoDiscoverFleet([&](int, int) {
+        discDone = true;
+    });
+    QTRY_VERIFY_WITH_TIMEOUT(discDone, 3000);
+
+    QCOMPARE(ctrl.lastDiscoveryRefreshedCount(), 1);
+    QCOMPARE(resolvedPods.size(), 2);
+    QVERIFY(resolvedPods.contains(QStringLiteral("krista-cold-01")));
+    QVERIFY(resolvedPods.contains(QStringLiteral("krista-cold-02")));
+    QVERIFY(!resolvedPods.contains(QStringLiteral("krista-cold-09")));
+
+    QCOMPARE(ctrl.profileById(QStringLiteral("krista-cold-01")).coinbaseAddress, QStringLiteral("FRESH_1"));
+    QCOMPARE(ctrl.profileById(QStringLiteral("krista-cold-02")).coinbaseAddress, QStringLiteral("KEEP_2"));
+    QCOMPARE(ctrl.profileById(QStringLiteral("krista-cold-09")).coinbaseAddress, QStringLiteral("STOPPED_9"));
+
+    // Verify persistence in both profiles.json and cpuminer_pod_addresses.txt
+    const QVector<WorkerProfile> reloaded = store.loadProfiles();
+    QString reloadedCold1Addr;
+    for (const WorkerProfile& rp : reloaded) {
+        if (rp.id == QStringLiteral("krista-cold-01")) {
+            reloadedCold1Addr = rp.coinbaseAddress;
+            break;
+        }
+    }
+    QCOMPARE(reloadedCold1Addr, QStringLiteral("FRESH_1"));
+
+    QFile rfAfter(podAddrFile);
+    QVERIFY(rfAfter.open(QIODevice::ReadOnly));
+    const QString afterText = QString::fromUtf8(rfAfter.readAll());
+    QVERIFY(afterText.contains(QStringLiteral("krista-cold-01 FRESH_1\n")));
+    QVERIFY(afterText.contains(QStringLiteral("krista-cold-02 KEEP_2\n")));
 }
 
 QTEST_MAIN(TestCore)

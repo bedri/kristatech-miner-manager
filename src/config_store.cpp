@@ -247,6 +247,64 @@ QString ConfigStore::defaultKristaTechConfPath()
 #endif
 }
 
+QString ConfigStore::defaultPodAddressesFilePath()
+{
+    return QDir::homePath() + QStringLiteral("/.kristatech/cpuminer_pod_addresses.txt");
+}
+
+bool ConfigStore::updatePodAddressesFile(const QHash<QString, QString>& updates,
+                                         const QString& path,
+                                         QString* errorOut)
+{
+    const QString targetPath = path.isEmpty() ? defaultPodAddressesFilePath() : path;
+    const QFileInfo targetInfo(targetPath);
+    if (!targetInfo.dir().exists()) {
+        if (errorOut) {
+            *errorOut = QStringLiteral("Target directory does not exist: ") + targetInfo.dir().absolutePath();
+        }
+        return false;
+    }
+
+    static const QRegularExpression reWs(QStringLiteral("\\s+"));
+    QHash<QString, QString> merged;
+
+    QFile rf(targetPath);
+    if (rf.open(QIODevice::ReadOnly)) {
+        const QStringList lines = QString::fromUtf8(rf.readAll()).split(QLatin1Char('\n'));
+        for (const QString& raw : lines) {
+            const QStringList parts = raw.trimmed().split(reWs, Qt::SkipEmptyParts);
+            if (parts.size() != 2) continue;
+            if (isValidPodmanName(parts[0])) {
+                merged.insert(parts[0], parts[1]);
+            }
+        }
+    }
+
+    for (auto it = updates.constBegin(); it != updates.constEnd(); ++it) {
+        const QString pod = it.key().trimmed();
+        const QString addr = it.value().trimmed();
+        if (!isValidPodmanName(pod) || addr.isEmpty() || reWs.match(addr).hasMatch()) {
+            continue;
+        }
+        merged.insert(pod, addr);
+    }
+
+    if (merged.isEmpty()) {
+        if (errorOut) {
+            *errorOut = QStringLiteral("No valid pod address entries to write");
+        }
+        return false;
+    }
+
+    QStringList pods = merged.keys();
+    pods.sort();
+    QByteArray out;
+    for (const QString& pod : pods) {
+        out.append((pod + QLatin1Char(' ') + merged.value(pod) + QLatin1Char('\n')).toUtf8());
+    }
+    return writeFile0600(targetPath, out, errorOut);
+}
+
 QVector<WorkerProfile> ConfigStore::loadProfiles(QString* errorOut) const
 {
     QFile f(profilesFilePath());

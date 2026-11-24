@@ -49,6 +49,15 @@ public:
     void discoverLocalRegisteredSeats(const QString& confPath,
                                       std::function<void(QVector<QString> addresses)> cb);
 
+    /** Selects the best mining address from a wallet's listaddressgroupings JSON (prefers active non-masternode ADAM seats). */
+    static QString pickBestPodmanAddress(const QJsonValue& groupingsVal,
+                                         const QHash<QString, PoolSeatInfo>& knownSeats);
+
+    /** Verifies currentAddress belongs to podName's wallet (ismine); if stale/empty, resolves a fresh owned address asynchronously. */
+    void resolvePodmanMiningAddress(const QString& podName,
+                                    const QString& currentAddress,
+                                    std::function<void(bool ok, const QString& resolvedAddress, bool changed)> cb);
+
 Q_SIGNALS:
     void targetStatusUpdated(const QString& targetKey, const NodeMiningStatus& status);
     void consensusStatusUpdated(const ConsensusStatus& status);

@@ -63,6 +63,17 @@ public:
     /** Discovers live miners, local wallet pool seats, and Podman containers. */
     void autoDiscoverFleet(std::function<void(int added, int adopted)> cb = nullptr);
 
+    /** Number of stale Podman worker coinbase addresses refreshed in the most recent discovery pass. */
+    int lastDiscoveryRefreshedCount() const { return m_lastDiscoveryRefreshedCount; }
+
+    using PodmanAddressResolver = std::function<void(const QString& podName,
+                                                     const QString& currentAddress,
+                                                     std::function<void(bool ok, const QString& resolvedAddress, bool changed)> cb)>;
+
+    void setPodmanDiscovererForTest(std::function<QVector<PodmanContainerInfo>()> fn);
+    void setPodmanAddressResolverForTest(PodmanAddressResolver resolver);
+    void setPodAddressesFilePathForTest(const QString& path);
+
     void importProfiles(const QVector<WorkerProfile>& imported, int* addedOut = nullptr);
 
     /** Shutdown helpers used when quitting GUI. */
@@ -123,6 +134,11 @@ private:
     QHash<QString, QProcess*> m_podmanStartProcs;
     QProcess* m_podmanNsCheckProc{nullptr};
     std::function<QString(qint64)> m_netNsResolver;
+    std::function<QVector<PodmanContainerInfo>()> m_podmanDiscoverer;
+    PodmanAddressResolver m_podmanAddressResolver;
+    bool m_podAddrPathOverridden{false};
+    QString m_podAddrPathForTest;
+    int m_lastDiscoveryRefreshedCount{0};
     QTimer m_logTimer;
     QTimer m_healthTimer;
     int m_healthTickCounter{0};

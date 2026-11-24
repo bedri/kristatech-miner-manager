@@ -4,6 +4,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QPointer>
 #include <QProcess>
 #include <QRegularExpression>
 #include <QSet>
@@ -1384,8 +1385,25 @@ int WorkerController::adoptRunningProcesses(bool createProfilesForUnknown)
     return adoptedCount;
 }
 
+void WorkerController::setPodmanDiscovererForTest(std::function<QVector<PodmanContainerInfo>()> fn)
+{
+    m_podmanDiscoverer = std::move(fn);
+}
+
+void WorkerController::setPodmanAddressResolverForTest(PodmanAddressResolver resolver)
+{
+    m_podmanAddressResolver = std::move(resolver);
+}
+
+void WorkerController::setPodAddressesFilePathForTest(const QString& path)
+{
+    m_podAddrPathOverridden = true;
+    m_podAddrPathForTest = path;
+}
+
 void WorkerController::autoDiscoverFleet(std::function<void(int added, int adopted)> cb)
 {
+    m_lastDiscoveryRefreshedCount = 0;
     const int prevCount = static_cast<int>(m_profiles.size());
     const int adopted = adoptRunningProcesses(/*createProfilesForUnknown=*/true);
 
@@ -1398,9 +1416,15 @@ void WorkerController::autoDiscoverFleet(std::function<void(int added, int adopt
         return false;
     };
 
-    // Add stopped Podman containers not currently running a miner
-    const QVector<PodmanContainerInfo> pods = ProcessScanner::discoverPodmanContainers();
+    // Add stopped/discovered Podman containers not currently in profiles
+    const QVector<PodmanContainerInfo> pods = m_podmanDiscoverer
+        ? m_podmanDiscoverer()
+        : ProcessScanner::discoverPodmanContainers();
+    QSet<QString> runningPods;
     for (const PodmanContainerInfo& pod : pods) {
+        if (pod.running) {
+            runningPods.insert(pod.name.trimmed());
+        }
         if (!hasProfileFor(TargetType::PodmanContainer, pod.name, pod.assignedAddress)) {
             WorkerProfile p;
             p.id = makeUniqueId(pod.name);
@@ -1419,26 +1443,111 @@ void WorkerController::autoDiscoverFleet(std::function<void(int added, int adopt
         }
     }
 
+    QPointer<WorkerController> self(this);
+    auto finishDiscovery = [self, prevCount, adopted, runningPods, cb]() {
+        if (!self) {
+            return;
+        }
+
+        auto finalize = [self, prevCount, adopted, cb](int refreshed, const QHash<QString, QString>& podAddrUpdates) {
+            if (!self) {
+                return;
+            }
+            self->m_lastDiscoveryRefreshedCount = refreshed;
+            if (!podAddrUpdates.isEmpty()) {
+                if (!self->m_podAddrPathOverridden) {
+                    ConfigStore::updatePodAddressesFile(podAddrUpdates);
+                } else if (!self->m_podAddrPathForTest.isEmpty()) {
+                    ConfigStore::updatePodAddressesFile(podAddrUpdates, self->m_podAddrPathForTest);
+                }
+            }
+            const int added = static_cast<int>(self->m_profiles.size()) - prevCount;
+            self->saveProfiles();
+            Q_EMIT self->workersChanged();
+            Q_EMIT self->discoveryFinished(added, adopted);
+            if (cb) cb(added, adopted);
+        };
+
+        struct PodResolveTarget {
+            QString workerId;
+            QString podName;
+            QString currentAddress;
+        };
+        QVector<PodResolveTarget> targets;
+        for (const WorkerProfile& p : self->m_profiles) {
+            if (p.targetType != TargetType::PodmanContainer) continue;
+            const QString podName = p.podmanName.trimmed();
+            if (podName.isEmpty() || !runningPods.contains(podName)) continue;
+            targets.append({p.id, podName, p.coinbaseAddress});
+        }
+
+        PodmanAddressResolver resolver = self->m_podmanAddressResolver;
+        if (!resolver && self->m_rpc) {
+            QPointer<RpcClient> rpcPtr(self->m_rpc);
+            resolver = [rpcPtr](const QString& podName,
+                                const QString& currentAddress,
+                                std::function<void(bool, const QString&, bool)> done) {
+                if (!rpcPtr) {
+                    if (done) done(false, currentAddress, false);
+                    return;
+                }
+                rpcPtr->resolvePodmanMiningAddress(podName, currentAddress, std::move(done));
+            };
+        }
+
+        if (targets.isEmpty() || !resolver) {
+            finalize(0, {});
+            return;
+        }
+
+        auto remaining = std::make_shared<int>(static_cast<int>(targets.size()));
+        auto refreshed = std::make_shared<int>(0);
+        auto podAddrUpdates = std::make_shared<QHash<QString, QString>>();
+
+        for (const PodResolveTarget& tgt : targets) {
+            resolver(tgt.podName, tgt.currentAddress,
+                     [self, tgt, remaining, refreshed, podAddrUpdates, finalize](
+                         bool ok, const QString& resolvedAddr, bool changed) {
+                         if (self && ok && changed && !resolvedAddr.trimmed().isEmpty()) {
+                             const QString cleanAddr = resolvedAddr.trimmed();
+                             const int idx = self->indexOfId(tgt.workerId);
+                             if (idx >= 0) {
+                                 self->m_profiles[idx].coinbaseAddress = cleanAddr;
+                                 if (self->m_runtimes.contains(tgt.workerId)) {
+                                     self->m_runtimes[tgt.workerId].warningDeferred = false;
+                                     self->m_runtimes[tgt.workerId].warningDeferredMsg.clear();
+                                 }
+                                 podAddrUpdates->insert(tgt.podName, cleanAddr);
+                                 ++(*refreshed);
+                             }
+                         }
+                         --(*remaining);
+                         if (*remaining <= 0) {
+                             finalize(*refreshed, *podAddrUpdates);
+                         }
+                     });
+        }
+    };
+
     const QString localConf = ConfigStore::defaultKristaTechConfPath();
     if (!m_rpc) {
-        const int added = static_cast<int>(m_profiles.size()) - prevCount;
-        if (added > 0) saveProfiles();
-        Q_EMIT workersChanged();
-        Q_EMIT discoveryFinished(added, adopted);
-        if (cb) cb(added, adopted);
+        finishDiscovery();
         return;
     }
 
-    m_rpc->discoverLocalRegisteredSeats(localConf, [this, prevCount, adopted, localConf, hasProfileFor, cb](QVector<QString> seats) {
+    m_rpc->discoverLocalRegisteredSeats(localConf, [self, localConf, hasProfileFor, finishDiscovery](QVector<QString> seats) {
+        if (!self) {
+            return;
+        }
         for (const QString& addr : seats) {
-            const PoolSeatInfo seat = m_rpc->seatInfoForAddress(addr);
+            const PoolSeatInfo seat = self->m_rpc->seatInfoForAddress(addr);
             // Skip VPS Masternodes which do not mine via local cpuminer RPC
             if (seat.track == QStringLiteral("masternode")) {
                 continue;
             }
             if (!hasProfileFor(TargetType::LocalWallet, QString(), addr)) {
                 WorkerProfile p;
-                p.id = makeUniqueId(QStringLiteral("local_") + addr.left(8));
+                p.id = self->makeUniqueId(QStringLiteral("local_") + addr.left(8));
                 p.name = QStringLiteral("Local ") + seat.track + QStringLiteral(" (") + addr.left(8) + QStringLiteral(")");
                 p.engine = MinerEngine::CpuMiner;
                 p.binaryPath = ProcessScanner::defaultCpuMinerPath();
@@ -1446,17 +1555,13 @@ void WorkerController::autoDiscoverFleet(std::function<void(int added, int adopt
                 p.confPath = localConf;
                 p.coinbaseAddress = addr;
                 p.threads = 1;
-                m_profiles.append(p);
+                self->m_profiles.append(p);
                 WorkerRuntime rt;
-                rt.logFilePath = m_store->defaultLogPath(p.id);
-                m_runtimes.insert(p.id, rt);
+                rt.logFilePath = self->m_store->defaultLogPath(p.id);
+                self->m_runtimes.insert(p.id, rt);
             }
         }
-        const int added = static_cast<int>(m_profiles.size()) - prevCount;
-        saveProfiles();
-        Q_EMIT workersChanged();
-        Q_EMIT discoveryFinished(added, adopted);
-        if (cb) cb(added, adopted);
+        finishDiscovery();
     });
 }
 

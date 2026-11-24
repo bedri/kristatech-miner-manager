@@ -3,6 +3,7 @@
 #include "models.h"
 
 #include <QByteArray>
+#include <QHash>
 #include <QString>
 #include <QStringList>
 #include <QVector>
@@ -52,6 +53,14 @@ public:
 
     /** Platform-appropriate default path to kristatech.conf. */
     static QString defaultKristaTechConfPath();
+
+    /** Platform path to ~/.kristatech/cpuminer_pod_addresses.txt. */
+    static QString defaultPodAddressesFilePath();
+
+    /** Merges updated pod->address entries into cpuminer_pod_addresses.txt atomically (0600). */
+    static bool updatePodAddressesFile(const QHash<QString, QString>& updates,
+                                       const QString& path = QString(),
+                                       QString* errorOut = nullptr);
 
     /** Resolves credentials live for LocalWallet/PodmanContainer or from profile for CustomRpc. */
     static RpcCredentials resolveCredentials(const WorkerProfile& profile);

@@ -6,7 +6,10 @@
 #include <QJsonObject>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QPointer>
 #include <QProcess>
+#include <QRegularExpression>
+#include <QSet>
 #include <QStandardPaths>
 #include <QUrl>
 
@@ -51,6 +54,27 @@ QString shellQuoteRpcArg(const QString& s)
     QString esc = s;
     esc.replace(QLatin1Char('\''), QStringLiteral("'\\''"));
     return QLatin1Char('\'') + esc + QLatin1Char('\'');
+}
+
+QHash<QString, PoolSeatInfo> parseAdamMinersArray(const QJsonArray& arr, qint64 height)
+{
+    QHash<QString, PoolSeatInfo> seats;
+    seats.reserve(arr.size());
+    for (const QJsonValue& v : arr) {
+        if (!v.isObject()) continue;
+        const QJsonObject o = v.toObject();
+        const QString addr = o.value(QStringLiteral("address")).toString().trimmed();
+        if (addr.isEmpty()) continue;
+        PoolSeatInfo seat;
+        seat.known = true;
+        seat.registered = true;
+        seat.track = o.value(QStringLiteral("track")).toString();
+        seat.unlockHeight = static_cast<qint64>(o.value(QStringLiteral("unlock_height")).toDouble(0));
+        seat.chainHeight = height;
+        seat.remainingBlocks = (height > 0 && seat.unlockHeight > height) ? (seat.unlockHeight - height) : 0;
+        seats.insert(addr, seat);
+    }
+    return seats;
 }
 
 } // namespace
@@ -192,24 +216,8 @@ void RpcClient::fetchPoolIfNeeded(const WorkerProfile& profile, const RpcCredent
                       return;
                   }
                   const QJsonArray arr = res.toArray();
-                  QHash<QString, PoolSeatInfo> next;
-                  QStringList allAddrs;
-                  next.reserve(arr.size());
-                  for (const QJsonValue& v : arr) {
-                      if (!v.isObject()) continue;
-                      const QJsonObject o = v.toObject();
-                      const QString addr = o.value(QStringLiteral("address")).toString().trimmed();
-                      if (addr.isEmpty()) continue;
-                      PoolSeatInfo seat;
-                      seat.known = true;
-                      seat.registered = true;
-                      seat.track = o.value(QStringLiteral("track")).toString();
-                      seat.unlockHeight = static_cast<qint64>(o.value(QStringLiteral("unlock_height")).toDouble(0));
-                      seat.chainHeight = height;
-                      seat.remainingBlocks = (seat.unlockHeight > height) ? (seat.unlockHeight - height) : 0;
-                      next.insert(addr, seat);
-                      allAddrs.append(addr);
-                  }
+                  const QHash<QString, PoolSeatInfo> next = parseAdamMinersArray(arr, height);
+                  const QStringList allAddrs = next.keys();
                   m_poolSeats = next;
                   m_lastPoolHeight = height;
                   m_lastPoolFetchMs = QDateTime::currentMSecsSinceEpoch();
@@ -463,8 +471,13 @@ void RpcClient::discoverLocalRegisteredSeats(const QString& confPath, std::funct
                               if (cb) cb({});
                               return;
                           }
+                          const QJsonArray arr = res.toArray();
+                          if (m_poolSeats.isEmpty()) {
+                              m_poolSeats = parseAdamMinersArray(arr, qMax<qint64>(0, m_lastPoolHeight));
+                              m_lastPoolFetchMs = QDateTime::currentMSecsSinceEpoch();
+                          }
                           QStringList addrs;
-                          for (const QJsonValue& v : res.toArray()) {
+                          for (const QJsonValue& v : arr) {
                               const QString a = v.toObject().value(QStringLiteral("address")).toString().trimmed();
                               if (!a.isEmpty()) addrs.append(a);
                           }
@@ -489,6 +502,182 @@ void RpcClient::discoverLocalRegisteredSeats(const QString& confPath, std::funct
                                                 });
                           }
                       });
+}
+
+QString RpcClient::pickBestPodmanAddress(const QJsonValue& groupingsVal,
+                                         const QHash<QString, PoolSeatInfo>& knownSeats)
+{
+    if (!groupingsVal.isArray()) {
+        return {};
+    }
+    static const QRegularExpression reWs(QStringLiteral("\\s"));
+    QStringList addresses;
+    QSet<QString> seen;
+
+    for (const QJsonValue& grpVal : groupingsVal.toArray()) {
+        if (!grpVal.isArray()) continue;
+        for (const QJsonValue& entryVal : grpVal.toArray()) {
+            if (!entryVal.isArray()) continue;
+            const QJsonArray entryArr = entryVal.toArray();
+            if (entryArr.isEmpty()) continue;
+            const QString cand = entryArr.at(0).toString().trimmed();
+            if (cand.isEmpty() || reWs.match(cand).hasMatch() || seen.contains(cand)) {
+                continue;
+            }
+            seen.insert(cand);
+            addresses.append(cand);
+        }
+    }
+
+    if (addresses.isEmpty()) {
+        return {};
+    }
+
+    auto trackRank = [](const QString& track) -> int {
+        if (track == QStringLiteral("coin_lock")) return 4;
+        if (track == QStringLiteral("pow_lock")) return 3;
+        if (track == QStringLiteral("bootstrap")) return 2;
+        if (track == QStringLiteral("zerocoin_pow")) return 1;
+        if (track == QStringLiteral("masternode")) return 0;
+        return track.isEmpty() ? 0 : 1;
+    };
+
+    QString bestSeated;
+    int bestRank = 0;
+    for (const QString& addr : addresses) {
+        if (!knownSeats.contains(addr)) continue;
+        const PoolSeatInfo& seat = knownSeats.value(addr);
+        if (!seat.registered) continue;
+        const int r = trackRank(seat.track);
+        if (r > bestRank) {
+            bestRank = r;
+            bestSeated = addr;
+        }
+    }
+    return !bestSeated.isEmpty() ? bestSeated : addresses.first();
+}
+
+void RpcClient::resolvePodmanMiningAddress(const QString& podName,
+                                           const QString& currentAddress,
+                                           std::function<void(bool ok, const QString& resolvedAddress, bool changed)> cb)
+{
+    const QString cleanPod = podName.trimmed();
+    const QString cleanCurrent = currentAddress.trimmed();
+    if (!isValidPodmanName(cleanPod)) {
+        if (cb) cb(false, cleanCurrent, false);
+        return;
+    }
+
+    WorkerProfile podProf;
+    podProf.targetType = TargetType::PodmanContainer;
+    podProf.podmanName = cleanPod;
+
+    QPointer<RpcClient> self(this);
+
+    auto fallbackNewAddress = std::make_shared<std::function<void()>>();
+    *fallbackNewAddress = [self, podProf, cleanCurrent, cb]() {
+        if (!self) {
+            if (cb) cb(false, cleanCurrent, false);
+            return;
+        }
+        self->invokeRpc(podProf, {}, QStringLiteral("getnewaddress"), QJsonArray{},
+                        [cleanCurrent, cb](bool okNew, const QJsonValue& resNew, const QString&) {
+                            static const QRegularExpression reWs(QStringLiteral("\\s"));
+                            if (okNew && resNew.isString()) {
+                                const QString newAddr = resNew.toString().trimmed();
+                                if (!newAddr.isEmpty() && !reWs.match(newAddr).hasMatch()) {
+                                    if (cb) cb(true, newAddr, newAddr != cleanCurrent);
+                                    return;
+                                }
+                            }
+                            if (cb) cb(false, cleanCurrent, false);
+                        });
+    };
+
+    auto pickFromWallet = std::make_shared<std::function<void(QHash<QString, PoolSeatInfo>)>>();
+    *pickFromWallet = [self, podProf, cleanCurrent, cb, fallbackNewAddress](QHash<QString, PoolSeatInfo> seatsSnapshot) {
+        if (!self) {
+            if (cb) cb(false, cleanCurrent, false);
+            return;
+        }
+        self->invokeRpc(podProf, {}, QStringLiteral("listaddressgroupings"), QJsonArray{},
+                        [self, podProf, cleanCurrent, cb, seatsSnapshot, fallbackNewAddress](
+                            bool okGrp, const QJsonValue& resGrp, const QString&) {
+                            if (!self) {
+                                if (cb) cb(false, cleanCurrent, false);
+                                return;
+                            }
+                            const QString picked = okGrp ? pickBestPodmanAddress(resGrp, seatsSnapshot) : QString();
+                            if (picked.isEmpty()) {
+                                (*fallbackNewAddress)();
+                                return;
+                            }
+                            QJsonArray valParams;
+                            valParams.append(picked);
+                            self->invokeRpc(podProf, {}, QStringLiteral("validateaddress"), valParams,
+                                            [cleanCurrent, picked, cb, fallbackNewAddress](
+                                                bool okVal, const QJsonValue& resVal, const QString&) {
+                                                const bool isMine = okVal && resVal.isObject()
+                                                    && resVal.toObject().value(QStringLiteral("ismine")).toBool(false);
+                                                if (isMine) {
+                                                    if (cb) cb(true, picked, picked != cleanCurrent);
+                                                    return;
+                                                }
+                                                (*fallbackNewAddress)();
+                                            });
+                        });
+    };
+
+    auto resolveReplacement = [self, podProf, cleanCurrent, cb, pickFromWallet]() {
+        if (!self) {
+            if (cb) cb(false, cleanCurrent, false);
+            return;
+        }
+        if (!self->m_poolSeats.isEmpty()) {
+            (*pickFromWallet)(self->m_poolSeats);
+            return;
+        }
+        self->invokeRpc(podProf, {}, QStringLiteral("getadamminers"), QJsonArray{},
+                        [self, cleanCurrent, cb, pickFromWallet](
+                            bool okPool, const QJsonValue& resPool, const QString&) {
+                            if (!self) {
+                                if (cb) cb(false, cleanCurrent, false);
+                                return;
+                            }
+                            QHash<QString, PoolSeatInfo> seatsSnapshot;
+                            if (okPool && resPool.isArray()) {
+                                seatsSnapshot = parseAdamMinersArray(
+                                    resPool.toArray(), qMax<qint64>(0, self->m_lastPoolHeight));
+                                if (self->m_poolSeats.isEmpty()) {
+                                    self->m_poolSeats = seatsSnapshot;
+                                    self->m_lastPoolFetchMs = QDateTime::currentMSecsSinceEpoch();
+                                }
+                            }
+                            (*pickFromWallet)(seatsSnapshot);
+                        });
+    };
+
+    if (!cleanCurrent.isEmpty()) {
+        QJsonArray params;
+        params.append(cleanCurrent);
+        invokeRpc(podProf, {}, QStringLiteral("validateaddress"), params,
+                  [cleanCurrent, cb, resolveReplacement](
+                      bool okCur, const QJsonValue& resCur, const QString&) {
+                      if (!okCur) {
+                          if (cb) cb(false, cleanCurrent, false);
+                          return;
+                      }
+                      const bool isMine = resCur.isObject()
+                          && resCur.toObject().value(QStringLiteral("ismine")).toBool(false);
+                      if (isMine) {
+                          if (cb) cb(true, cleanCurrent, false);
+                          return;
+                      }
+                      resolveReplacement();
+                  });
+    } else {
+        resolveReplacement();
+    }
 }
 
 void RpcClient::invokeRpc(const WorkerProfile& profile,
