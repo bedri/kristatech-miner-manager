@@ -1192,6 +1192,7 @@ int WorkerController::countRunningUnregisteredOrDeferred() const
         const WorkerRuntime& rt = m_runtimes.value(p.id);
         if (rt.pid <= 0 || rt.status == WorkerStatus::Stopped || rt.status == WorkerStatus::Error) continue;
         const PoolSeatInfo seat = m_rpc->seatInfoForAddress(p.coinbaseAddress);
+        if (seat.known && seat.registered) continue;
         if ((seat.known && !seat.registered) || rt.warningDeferred) {
             ++n;
         }
@@ -1208,6 +1209,7 @@ int WorkerController::stopUnregisteredOrDeferred()
         const WorkerRuntime& rt = m_runtimes.value(p.id);
         if (rt.pid <= 0 || rt.status == WorkerStatus::Stopped || rt.status == WorkerStatus::Error) continue;
         const PoolSeatInfo seat = m_rpc->seatInfoForAddress(p.coinbaseAddress);
+        if (seat.known && seat.registered) continue;
         if ((seat.known && !seat.registered) || rt.warningDeferred) {
             ids.append(p.id);
         }
@@ -2055,7 +2057,7 @@ void WorkerController::parseLogLine(const QString& sanitizedLine, WorkerRuntime&
         rt.warningDeferredMsg = m.captured(1).trimmed();
     }
     static const QRegularExpression reRegActive(
-        QStringLiteral("ADAM Auto-Register:.*(?:is active in ADAM pool|registered successfully|successfully registered)"),
+        QStringLiteral("ADAM Auto-Register:.*(?:is active in ADAM pool|\\bactive\\s*\\(|registered successfully|successfully registered)"),
         QRegularExpression::CaseInsensitiveOption);
     if (reRegActive.match(sanitizedLine).hasMatch()) {
         rt.warningDeferred = false;

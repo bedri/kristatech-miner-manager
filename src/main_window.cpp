@@ -787,14 +787,16 @@ void MainWindow::rebuildTable()
 
         const bool isRunning = (rt.pid > 0 && rt.status != WorkerStatus::Stopped && rt.status != WorkerStatus::Error) ||
                                rt.status == WorkerStatus::Restarting || rt.status == WorkerStatus::Starting;
+        const bool seatRegistered = seat.known && seat.registered;
         const bool unregWarn = !p.coinbaseAddress.isEmpty() && seat.known && !seat.registered;
+        const bool deferredWarn = rt.warningDeferred && !seatRegistered;
         const bool rpcOfflineWarn = nodeSt.checked && !nodeSt.reachable;
         const bool missingAddrWarn = p.coinbaseAddress.isEmpty();
         const bool statusErrWarn = (rt.status == WorkerStatus::Error);
         const bool walletLockedWarn = (nodeSt.reachable && nodeSt.walletLocked) || rt.warningWalletLocked;
         const bool expiringWarn = seat.isExpiringSoon(chain);
         const bool nodeAlertWarn = nodeSt.reachable && !nodeSt.nodeErrors.isEmpty();
-        const bool hasWarn = unregWarn || rt.warningDeferred || rt.warningRpcError ||
+        const bool hasWarn = unregWarn || deferredWarn || rt.warningRpcError ||
                              rpcOfflineWarn || missingAddrWarn || statusErrWarn ||
                              walletLockedWarn || expiringWarn || nodeAlertWarn;
 
@@ -854,18 +856,10 @@ void MainWindow::rebuildTable()
             poolText = QStringLiteral("🔒 ") + KTr(QStringLiteral("pool.wallet_locked"));
             poolColor = QColor(tc.dangerFg);
             poolTip = KTr(QStringLiteral("warn.wallet_locked_banner"));
-            if (seat.registered) {
+            if (seatRegistered) {
                 poolTip += QStringLiteral("\n") + formatSeatTrackBadge(seat);
             }
-        } else if (rt.warningDeferred) {
-            poolText = QStringLiteral("⚠ ") + KTr(QStringLiteral("pool.deferred"));
-            poolColor = QColor(tc.warnFg);
-        } else if (!seat.known && rpcOfflineWarn) {
-            poolText = QStringLiteral("⚠ ") + KTr(QStringLiteral("pool.rpc_offline"));
-            poolColor = QColor(tc.dangerFg);
-        } else if (!seat.known) {
-            poolText = KTr(QStringLiteral("pool.checking"));
-        } else if (seat.registered) {
+        } else if (seatRegistered) {
             const QString badge = formatSeatTrackBadge(seat);
             const qint64 approxMin = qMax<qint64>(1, (seat.remainingBlocks * 30 + 30) / 60);
             if (expiringWarn) {
@@ -887,6 +881,20 @@ void MainWindow::rebuildTable()
                           .arg(seat.renewalThresholdBlocks(chain))
                     : KTr(QStringLiteral("pool.permanent_tip")).arg(seat.track);
             }
+            if (rt.warningDeferred && !rt.warningDeferredMsg.isEmpty()) {
+                poolTip += QStringLiteral("\n") + rt.warningDeferredMsg;
+            }
+        } else if (deferredWarn) {
+            poolText = QStringLiteral("⚠ ") + KTr(QStringLiteral("pool.deferred"));
+            poolColor = QColor(tc.warnFg);
+            if (!rt.warningDeferredMsg.isEmpty()) {
+                poolTip = rt.warningDeferredMsg;
+            }
+        } else if (!seat.known && rpcOfflineWarn) {
+            poolText = QStringLiteral("⚠ ") + KTr(QStringLiteral("pool.rpc_offline"));
+            poolColor = QColor(tc.dangerFg);
+        } else if (!seat.known) {
+            poolText = KTr(QStringLiteral("pool.checking"));
         } else {
             poolText = QStringLiteral("⚠ ") + KTr(QStringLiteral("pool.unregistered"));
             poolColor = QColor(tc.dangerFg);
@@ -1364,8 +1372,9 @@ void MainWindow::updateInspector()
     if (seat.registered) meta += QStringLiteral("  •  %1").arg(formatSeatTrackBadge(seat));
     m_lblInspectorMeta->setText(meta);
 
+    const bool seatRegistered = seat.known && seat.registered;
     const bool walletLockedWarn = (nodeSt.reachable && nodeSt.walletLocked) || rt.warningWalletLocked;
-    const bool wasteWarn = rt.warningDeferred || (!p.coinbaseAddress.isEmpty() && seat.known && !seat.registered);
+    const bool wasteWarn = (!seatRegistered && rt.warningDeferred) || (!p.coinbaseAddress.isEmpty() && seat.known && !seat.registered);
     const bool expiringWarn = seat.isExpiringSoon(chain);
     const bool nodeAlertWarn = nodeSt.reachable && !nodeSt.nodeErrors.isEmpty();
 

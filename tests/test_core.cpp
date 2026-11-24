@@ -312,6 +312,18 @@ void TestCore::testAutoStopOnDeferred()
     QCOMPARE(rtAfterRestart.status, WorkerStatus::Stopped);
     QCOMPARE(rtAfterRestart.userStopped, true);
 
+    // 4. Active registered seat takes precedence over deferred promotion/renewal warnings
+    QHash<QString, PoolSeatInfo> activeSeats;
+    activeSeats.insert(p.coinbaseAddress, PoolSeatInfo{true, true, QStringLiteral("bootstrap"), 0, 0, 6034});
+    rpc.setPoolSeatsForTest(activeSeats, 6034);
+    QTest::qWait(100);
+    controller.startWorker(p.id);
+    QTRY_VERIFY_WITH_TIMEOUT(controller.runtimeById(p.id).warningDeferred, 4000);
+    QCOMPARE(autoStoppedSpy.count(), 2);
+    QVERIFY(controller.runtimeById(p.id).status != WorkerStatus::Stopped);
+    QCOMPARE(controller.countRunningUnregisteredOrDeferred(), 0);
+    QCOMPARE(controller.stopUnregisteredOrDeferred(), 0);
+
     controller.stopWorker(p.id);
 #else
     QSKIP("POSIX shell mock process test skipped on Windows");
@@ -1277,6 +1289,14 @@ void TestCore::testKristaFairnessRpcAndSeatExpiry()
     QVERIFY(!rt.warningWalletLocked);
 
     rt.warningDeferred = true;
+    rt.warningWalletLocked = true;
+    WorkerController::parseLogLine(
+        QStringLiteral("[2026-11-24 15:44:05] ADAM Auto-Register: Miner KTgoQGUX4DZ75U1xBGvvwjnRNZJaiLWXYTZ active (bootstrap, unlock=0, 999999 blocks left, renew<=24)."),
+        rt);
+    QVERIFY(!rt.warningDeferred);
+    QVERIFY(!rt.warningWalletLocked);
+
+    rt.warningDeferred = true;
     WorkerController::parseLogLine(
         QStringLiteral("[2026-11-22 10:00:12] ADAM Auto-Register: A PoW-Lock registration is pending in mempool (waiting for block #9001)"),
         rt);
@@ -1820,24 +1840,27 @@ void TestCore::testPodmanAddressRefreshAndSelection()
     ctrl.loadInitialState(/*autoDiscoverIfEmpty=*/false);
 
     WorkerProfile cold1;
-    cold1.id = QStringLiteral("krista-cold-01");
-    cold1.name = QStringLiteral("krista-cold-01");
+    cold1.id = QStringLiteral("mock-pod-01");
+    cold1.name = QStringLiteral("mock-pod-01");
     cold1.engine = MinerEngine::CpuMiner;
     cold1.targetType = TargetType::PodmanContainer;
-    cold1.podmanName = QStringLiteral("krista-cold-01");
+    cold1.podmanName = QStringLiteral("mock-pod-01");
     cold1.coinbaseAddress = QStringLiteral("OLD_1");
     ctrl.addProfile(cold1);
 
     WorkerProfile cold2;
-    cold2.id = QStringLiteral("krista-cold-02");
-    cold2.name = QStringLiteral("krista-cold-02");
+    cold2.id = QStringLiteral("mock-pod-02");
+    cold2.name = QStringLiteral("mock-pod-02");
     cold2.engine = MinerEngine::CpuMiner;
     cold2.targetType = TargetType::PodmanContainer;
-    cold2.podmanName = QStringLiteral("krista-cold-02");
+    cold2.podmanName = QStringLiteral("mock-pod-02");
     cold2.coinbaseAddress = QStringLiteral("KEEP_2");
     ctrl.addProfile(cold2);
 
-    ctrl.setPodAddressesFilePathForTest(podAddrFile);
+    const QString mockPodAddrFile = tmpDir.filePath(QStringLiteral("mock_pod_addresses.txt"));
+    QVERIFY(ConfigStore::writeFile0600(
+        mockPodAddrFile, QByteArray("mock-pod-01 OLD_1\nmock-pod-02 KEEP_2\n")));
+    ctrl.setPodAddressesFilePathForTest(mockPodAddrFile);
     ctrl.setPodmanDiscovererForTest([]() {
         auto makePod = [](const QString& name, bool running, qint64 pid, const QString& addr) {
             PodmanContainerInfo info;
@@ -1848,9 +1871,9 @@ void TestCore::testPodmanAddressRefreshAndSelection()
             return info;
         };
         QVector<PodmanContainerInfo> pods;
-        pods.append(makePod(QStringLiteral("krista-cold-01"), true, 1001, QStringLiteral("OLD_1")));
-        pods.append(makePod(QStringLiteral("krista-cold-02"), true, 1002, QStringLiteral("KEEP_2")));
-        pods.append(makePod(QStringLiteral("krista-cold-09"), false, 0, QStringLiteral("STOPPED_9")));
+        pods.append(makePod(QStringLiteral("mock-pod-01"), true, 1001, QStringLiteral("OLD_1")));
+        pods.append(makePod(QStringLiteral("mock-pod-02"), true, 1002, QStringLiteral("KEEP_2")));
+        pods.append(makePod(QStringLiteral("mock-pod-09"), false, 0, QStringLiteral("STOPPED_9")));
         return pods;
     });
 
@@ -1860,7 +1883,7 @@ void TestCore::testPodmanAddressRefreshAndSelection()
                         const QString& curAddr,
                         std::function<void(bool, const QString&, bool)> done) {
             resolvedPods.append(podName);
-            if (podName == QStringLiteral("krista-cold-01")) {
+            if (podName == QStringLiteral("mock-pod-01")) {
                 done(true, QStringLiteral("FRESH_1"), curAddr != QStringLiteral("FRESH_1"));
             } else {
                 done(true, curAddr, false);
@@ -1875,30 +1898,30 @@ void TestCore::testPodmanAddressRefreshAndSelection()
 
     QCOMPARE(ctrl.lastDiscoveryRefreshedCount(), 1);
     QCOMPARE(resolvedPods.size(), 2);
-    QVERIFY(resolvedPods.contains(QStringLiteral("krista-cold-01")));
-    QVERIFY(resolvedPods.contains(QStringLiteral("krista-cold-02")));
-    QVERIFY(!resolvedPods.contains(QStringLiteral("krista-cold-09")));
+    QVERIFY(resolvedPods.contains(QStringLiteral("mock-pod-01")));
+    QVERIFY(resolvedPods.contains(QStringLiteral("mock-pod-02")));
+    QVERIFY(!resolvedPods.contains(QStringLiteral("mock-pod-09")));
 
-    QCOMPARE(ctrl.profileById(QStringLiteral("krista-cold-01")).coinbaseAddress, QStringLiteral("FRESH_1"));
-    QCOMPARE(ctrl.profileById(QStringLiteral("krista-cold-02")).coinbaseAddress, QStringLiteral("KEEP_2"));
-    QCOMPARE(ctrl.profileById(QStringLiteral("krista-cold-09")).coinbaseAddress, QStringLiteral("STOPPED_9"));
+    QCOMPARE(ctrl.profileById(QStringLiteral("mock-pod-01")).coinbaseAddress, QStringLiteral("FRESH_1"));
+    QCOMPARE(ctrl.profileById(QStringLiteral("mock-pod-02")).coinbaseAddress, QStringLiteral("KEEP_2"));
+    QCOMPARE(ctrl.profileById(QStringLiteral("mock-pod-09")).coinbaseAddress, QStringLiteral("STOPPED_9"));
 
     // Verify persistence in both profiles.json and cpuminer_pod_addresses.txt
     const QVector<WorkerProfile> reloaded = store.loadProfiles();
     QString reloadedCold1Addr;
     for (const WorkerProfile& rp : reloaded) {
-        if (rp.id == QStringLiteral("krista-cold-01")) {
+        if (rp.id == QStringLiteral("mock-pod-01")) {
             reloadedCold1Addr = rp.coinbaseAddress;
             break;
         }
     }
     QCOMPARE(reloadedCold1Addr, QStringLiteral("FRESH_1"));
 
-    QFile rfAfter(podAddrFile);
+    QFile rfAfter(mockPodAddrFile);
     QVERIFY(rfAfter.open(QIODevice::ReadOnly));
     const QString afterText = QString::fromUtf8(rfAfter.readAll());
-    QVERIFY(afterText.contains(QStringLiteral("krista-cold-01 FRESH_1\n")));
-    QVERIFY(afterText.contains(QStringLiteral("krista-cold-02 KEEP_2\n")));
+    QVERIFY(afterText.contains(QStringLiteral("mock-pod-01 FRESH_1\n")));
+    QVERIFY(afterText.contains(QStringLiteral("mock-pod-02 KEEP_2\n")));
 }
 
 QTEST_MAIN(TestCore)

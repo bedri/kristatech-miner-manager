@@ -826,6 +826,35 @@ void TestUi::testActionButtonsNotClippedWithVerticalScrollbar()
 
     I18n::instance().setLanguage(I18n::Language::EN);
 #ifndef Q_OS_WIN
+    auto findWorkerRow = [&](const QString& workerId) -> int {
+        for (int r = 0; r < table->rowCount(); ++r) {
+            if (QTableWidgetItem* it = table->item(r, 0)) {
+                if (it->data(Qt::UserRole).toString() == workerId) return r;
+            }
+        }
+        return -1;
+    };
+    const int w1RowBefore = findWorkerRow(QStringLiteral("worker_01"));
+    QVERIFY(w1RowBefore >= 0);
+    QCOMPARE(table->item(w1RowBefore, 4)->text(), QStringLiteral("⚠ Auto-Register Deferred"));
+
+    QHash<QString, PoolSeatInfo> bsSeat;
+    bsSeat.insert(QStringLiteral("KTdHzRF4e71xcU1ea8tePLmZNijUnH001ZNYm"),
+                  PoolSeatInfo{true, true, QStringLiteral("bootstrap"), 0, 0, 6034});
+    rpc.setPoolSeatsForTest(bsSeat, 6034);
+    QApplication::processEvents();
+
+    const int w1RowAfter = findWorkerRow(QStringLiteral("worker_01"));
+    QVERIFY(w1RowAfter >= 0);
+    QCOMPARE(table->item(w1RowAfter, 4)->text(), QStringLiteral("✓ bootstrap"));
+    QVERIFY(table->item(w1RowAfter, 4)->toolTip().contains(QStringLiteral("10-KRISTA PoW-Lock seat")));
+
+    table->selectRow(w1RowAfter);
+    QApplication::processEvents();
+    QFrame* warnBanner = win.findChild<QFrame*>(QStringLiteral("warningBanner"));
+    QVERIFY(warnBanner != nullptr);
+    QVERIFY(!warnBanner->isVisibleTo(&win));
+
     controller.stopWorker(QStringLiteral("worker_01"));
 #endif
 }
