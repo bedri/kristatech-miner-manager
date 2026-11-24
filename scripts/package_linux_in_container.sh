@@ -9,29 +9,46 @@ STAGE_DIR="${DIST_DIR}/${STAGE_NAME}"
 TAR_OUT="${DIST_DIR}/${STAGE_NAME}.tar.gz"
 RUN_OUT="${DIST_DIR}/${STAGE_NAME}.run"
 
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y --no-install-recommends \
-    build-essential \
-    cmake \
-    ninja-build \
-    pkg-config \
-    qt6-base-dev \
-    qt6-base-dev-tools \
-    libgl-dev \
-    libegl-dev \
-    libxkbcommon-dev \
-    patchelf \
-    file \
-    binutils \
-    tar \
-    gzip \
-    ca-certificates \
-    python3
+linux_deps_ready() {
+    command -v g++ >/dev/null 2>&1 \
+        && command -v cmake >/dev/null 2>&1 \
+        && command -v ninja >/dev/null 2>&1 \
+        && command -v patchelf >/dev/null 2>&1 \
+        && command -v python3 >/dev/null 2>&1 \
+        && command -v strip >/dev/null 2>&1 \
+        && [ -d /usr/lib/x86_64-linux-gnu/qt6/plugins -o -d /usr/lib/qt6/plugins ] \
+        && [ -d /usr/lib/x86_64-linux-gnu/cmake/Qt6 -o -d /usr/lib/cmake/Qt6 ]
+}
 
-for opt_pkg in qt6-wayland qt6-image-formats-plugins libqt6svg6; do
-    apt-get install -y --no-install-recommends "$opt_pkg" || true
-done
+if [ "${KMM_SKIP_DEPS:-0}" = "1" ] && linux_deps_ready; then
+    echo "Using pre-installed Linux build dependencies (KMM_SKIP_DEPS=1)."
+elif [ "${KMM_FORCE_DEPS:-0}" != "1" ] && linux_deps_ready; then
+    echo "Linux build dependencies already present; skipping apt-get install."
+else
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        ninja-build \
+        pkg-config \
+        qt6-base-dev \
+        qt6-base-dev-tools \
+        libgl-dev \
+        libegl-dev \
+        libxkbcommon-dev \
+        patchelf \
+        file \
+        binutils \
+        tar \
+        gzip \
+        ca-certificates \
+        python3
+
+    for opt_pkg in qt6-wayland qt6-image-formats-plugins libqt6svg6; do
+        apt-get install -y --no-install-recommends "$opt_pkg" || true
+    done
+fi
 
 rm -rf "${BUILD_DIR}" "${STAGE_DIR}"
 mkdir -p "${DIST_DIR}"

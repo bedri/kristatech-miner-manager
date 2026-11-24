@@ -8,16 +8,40 @@ DIST_DIR="${WORK_DIR}/dist"
 STAGE_DIR="${DIST_DIR}/${STAGE_NAME}"
 ZIP_OUT="${DIST_DIR}/${STAGE_NAME}.zip"
 
-dnf install -y --setopt=install_weak_deps=False \
-    mingw64-gcc-c++ \
-    mingw64-cmake \
-    mingw64-qt6-qtbase \
-    mingw64-binutils \
-    qt6-qtbase-devel \
-    ninja-build \
-    zip \
-    file \
-    python3
+win64_deps_ready() {
+    command -v mingw64-cmake >/dev/null 2>&1 \
+        && command -v x86_64-w64-mingw32-g++ >/dev/null 2>&1 \
+        && command -v x86_64-w64-mingw32-objdump >/dev/null 2>&1 \
+        && command -v ninja >/dev/null 2>&1 \
+        && command -v zip >/dev/null 2>&1 \
+        && command -v file >/dev/null 2>&1 \
+        && command -v python3 >/dev/null 2>&1 \
+        && [ -f /usr/x86_64-w64-mingw32/sys-root/mingw/lib/cmake/Qt6/Qt6Config.cmake ] \
+        && [ -f /usr/lib64/cmake/Qt6/Qt6Config.cmake ]
+}
+
+if [ "${KMM_SKIP_DEPS:-0}" = "1" ] && win64_deps_ready; then
+    echo "Using pre-installed Windows MinGW build dependencies (KMM_SKIP_DEPS=1)."
+elif [ "${KMM_FORCE_DEPS:-0}" != "1" ] && win64_deps_ready; then
+    echo "Windows MinGW build dependencies already present; skipping dnf install."
+else
+    dnf install -y \
+        --setopt=install_weak_deps=False \
+        --setopt=fastestmirror=True \
+        --setopt=max_parallel_downloads=10 \
+        --setopt=retries=10 \
+        --setopt=timeout=20 \
+        --setopt=minrate=20000 \
+        mingw64-gcc-c++ \
+        mingw64-cmake \
+        mingw64-qt6-qtbase \
+        mingw64-binutils \
+        qt6-qtbase-devel \
+        ninja-build \
+        zip \
+        file \
+        python3
+fi
 
 rm -rf "${BUILD_DIR}" "${STAGE_DIR}" "${ZIP_OUT}"
 mkdir -p "${DIST_DIR}"

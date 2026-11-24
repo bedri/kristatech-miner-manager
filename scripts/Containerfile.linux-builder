@@ -1,0 +1,33 @@
+FROM docker.io/library/ubuntu:22.04
+
+LABEL org.opencontainers.image.title="KristaTech Miner Manager Linux Builder" \
+      org.opencontainers.image.description="Pre-baked Ubuntu 22.04 + Qt 6.2.4 + CMake/Ninja/patchelf builder for portable Linux artifacts"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV KMM_SKIP_DEPS=1
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        ninja-build \
+        pkg-config \
+        qt6-base-dev \
+        qt6-base-dev-tools \
+        libgl-dev \
+        libegl-dev \
+        libxkbcommon-dev \
+        patchelf \
+        file \
+        binutils \
+        tar \
+        gzip \
+        ca-certificates \
+        python3 && \
+    for opt_pkg in qt6-wayland qt6-image-formats-plugins libqt6svg6; do \
+        apt-get install -y --no-install-recommends "$opt_pkg" || true; \
+    done && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work

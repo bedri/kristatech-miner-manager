@@ -45,9 +45,11 @@ Run headless smoke test:
 QT_QPA_PLATFORM=offscreen ./build/kristatech-miner-manager --smoke-test
 ```
 
-Portable container builds (Linux Qt 6.2.4 AppDir/tarball & Windows MinGW Qt 6.8.3 zip):
+Portable container builds using cached local Podman builder images (Linux Qt 6.2.4 `.tar.gz`/`.run` & Windows MinGW Qt 6.8.3 `.zip`):
 
 ```bash
-./scripts/package_linux_in_container.sh
-./scripts/package_windows_in_container.sh
+./scripts/build_portable_linux.sh
+./scripts/build_portable_windows.sh
 ```
+
+On the first run, each wrapper builds and caches its builder image (`localhost/kmm-linux-builder:ubuntu22.04` or `localhost/kmm-win64-builder:fedora41`) from `scripts/Containerfile.*` so `apt-get`/`dnf` packages are only downloaded once. Subsequent builds reuse the cached image directly (pass `--image-only` to prebuild or `--rebuild-image` to refresh packages). Run the two scripts sequentially on SELinux hosts because both mount the workspace with `:Z`.

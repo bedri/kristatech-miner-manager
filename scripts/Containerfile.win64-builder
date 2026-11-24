@@ -1,0 +1,26 @@
+FROM registry.fedoraproject.org/fedora:41
+
+LABEL org.opencontainers.image.title="KristaTech Miner Manager Windows MinGW Builder" \
+      org.opencontainers.image.description="Pre-baked Fedora 41 + MinGW64 Qt6 + CMake/Ninja builder for portable Windows x86_64 artifacts"
+
+ENV KMM_SKIP_DEPS=1
+
+RUN dnf install -y \
+        --setopt=install_weak_deps=False \
+        --setopt=fastestmirror=True \
+        --setopt=max_parallel_downloads=10 \
+        --setopt=retries=10 \
+        --setopt=timeout=20 \
+        --setopt=minrate=20000 \
+        mingw64-gcc-c++ \
+        mingw64-cmake \
+        mingw64-qt6-qtbase \
+        mingw64-binutils \
+        qt6-qtbase-devel \
+        ninja-build \
+        zip \
+        file \
+        python3 && \
+    dnf clean all
+
+WORKDIR /work
